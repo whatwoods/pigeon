@@ -5,7 +5,6 @@ import {
   Copy,
   Download,
   Feather,
-  FileText,
   FileUp,
   Laptop,
   Link,
@@ -19,6 +18,7 @@ import { api } from "./lib/api";
 import { deriveAesKey, decryptText, encryptText } from "./lib/crypto";
 import { ensureDeviceIdentity, type DeviceIdentity } from "./lib/deviceIdentity";
 import { createLocalPackage, type LocalPackage } from "./lib/filePackage";
+import { FileVisual } from "./FileVisual";
 import { formatBytes, formatCount } from "./lib/format";
 import { PackageReceiver, PackageSender, type ConnectionRoute, type ProgressEvent } from "./lib/peerTransfer";
 import { createReceiveSink } from "./lib/receiveSink";
@@ -75,6 +75,8 @@ const CONNECTION_ROUTE_LABELS: Record<ConnectionRoute, string> = {
   direct: "点对点直连",
   relay: "正在中继"
 };
+
+const IS_MOBILE = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
 
 export default function App() {
   const [identity, setIdentity] = useState<DeviceIdentity | null>(null);
@@ -349,7 +351,13 @@ export default function App() {
 
   async function handlePasteClick() {
     try {
-      const items = await navigator.clipboard.read?.();
+      let items: ClipboardItems | undefined;
+      try {
+        items = await navigator.clipboard.read?.();
+      } catch (err) {
+        // Ignore read() errors (e.g. unsupported formats), fallback to readText()
+      }
+
       if (items) {
         const pastedFiles: File[] = [];
         for (const item of items) {
@@ -366,21 +374,18 @@ export default function App() {
           await handleFiles(pastedFiles);
           return;
         }
-
-        for (const item of items) {
-          const imageType = item.types.find((type) => type.startsWith("image/"));
-          if (imageType) {
-            const blob = await item.getType(imageType);
-            const ext = blob.type.split("/")[1] || "png";
-            await handleFiles([new File([blob], `pasted_image.${ext}`, { type: blob.type })]);
-            return;
-          }
-        }
       }
 
       const text = await navigator.clipboard.readText();
       if (!text.trim()) {
-        setStatus("剪贴板为空");
+        if (items) {
+          setStatus("剪贴板为空");
+        } else {
+          // 如果 items 为 undefined，说明前面 read() 不支持或抛错了。
+          // 此时剪切板里可能有图片，只是没读出来，所以引导用户使用全局快捷键
+          document.body.focus();
+          setStatus(IS_MOBILE ? "无法读取剪切板文件，请手动选择文件" : "无法读取文件，请尝试快捷键 Ctrl+V / Cmd+V 粘贴");
+        }
         return;
       }
       setClipboardText(text);
@@ -389,23 +394,33 @@ export default function App() {
       setStatus("文本已就绪");
       setView("file_preview");
     } catch {
-      setStatus("无法自动读取剪贴板，请直接按 Ctrl+V / Cmd+V 粘贴");
+      // Clipboard API 不可用或被拒绝，聚焦页面以便用户直接 Ctrl+V
+      document.body.focus();
+      setStatus(IS_MOBILE ? "无法读取剪切板，请检查权限或选择文件" : "请使用快捷键 Ctrl+V / Cmd+V 粘贴");
     }
   }
 
   useEffect(() => {
     const handleGlobalPaste = (event: ClipboardEvent) => {
       if (view !== "idle" && view !== "enter_code") return;
+      const files = event.clipboardData?.files;
+      if (files && files.length > 0) {
+        void handleFiles(files);
+        return;
+      }
+
       const items = event.clipboardData?.items;
       if (items) {
+        const pastedFiles: File[] = [];
         for (const item of items) {
           if (item.kind === "file") {
             const file = item.getAsFile();
-            if (file) {
-              void handleFiles([file]);
-              return;
-            }
+            if (file) pastedFiles.push(file);
           }
+        }
+        if (pastedFiles.length > 0) {
+          void handleFiles(pastedFiles);
+          return;
         }
       }
 
@@ -917,11 +932,13 @@ function IdleCard({
   onPaste: () => void;
   onReceive: () => void;
 }) {
+  const isHint = status.includes("Ctrl+V") || status.includes("为空") || status.includes("断开") || status.includes("权限") || status.includes("手动");
+
   return (
     <GlassCard className="idle-card">
       <div className="card-intro">
-        <h1>{status || "准备就绪"}</h1>
-        <p>选择或拖入文件，即可分享</p>
+        <h1>{isHint ? "端到端加密" : (status || "准备就绪")}</h1>
+        <p>{IS_MOBILE ? "选择文件，即可分享" : "选择或拖入文件，即可分享"}</p>
       </div>
       <input ref={fileInputRef} type="file" multiple hidden onChange={(event) => onFiles(event.currentTarget.files)} />
       <div className="orb-button-wrap">
@@ -931,12 +948,21 @@ function IdleCard({
           <span>选择文件</span>
         </motion.button>
       </div>
+      {isHint && (
+        <motion.div
+          initial={{ opacity: 0, y: -4 }}
+          animate={{ opacity: 1, y: 0 }}
+          style={{ color: "#ff6b6b", fontSize: "0.85rem", marginBottom: "0.75rem", fontWeight: 500, textAlign: "center" }}
+        >
+          {status}
+        </motion.div>
+      )}
       <div className="card-actions">
-        <button className="soft-action" onClick={onPaste}>
+        <button className="primary-action" onClick={onPaste}>
           <ClipboardPaste />
           <span>粘贴投送</span>
         </button>
-        <button className="soft-action muted-action" onClick={onReceive}>
+        <button className="soft-action" onClick={onReceive}>
           <Download />
           <span>接收文件</span>
         </button>
@@ -968,7 +994,7 @@ function PreviewCard({
           <div className="text-preview">{clipboardText}</div>
         ) : (
           <>
-            <div className="file-icon"><FileText /></div>
+            <FileVisual name={localPackage?.manifest.name} isFolder={localPackage ? localPackage.manifest.entries.length > 1 : false} />
             <h2 title={localPackage?.manifest.name}>{localPackage?.manifest.name}</h2>
             <p>{localPackage ? `${formatCount(localPackage.manifest.entries.length)} · ${formatBytes(localPackage.manifest.totalBytes)}` : ""}</p>
             {localPackage?.warnings.map((warning) => <p className="warning" key={warning}>{warning}</p>)}
@@ -1069,7 +1095,7 @@ function IncomingPackageCard({
         <div className="security-chip"><Lock /><span>端到端加密</span></div>
       </div>
       <div className="preview-body">
-        <div className="file-icon"><FileText /></div>
+        <FileVisual name={manifest.name} isFolder={manifest.entries.length > 1} />
         <h2 title={manifest.name}>{manifest.name}</h2>
         <p>{formatCount(manifest.entries.length)} · {formatBytes(manifest.totalBytes)}</p>
       </div>

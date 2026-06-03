@@ -99,7 +99,8 @@ npm run deploy
 | `npm run build` | 生产构建 |
 | `npm run preview` | 预览生产构建 |
 | `npm run deploy` | 部署到 Cloudflare Workers |
-| `npm run db:migrate` | 执行 D1 数据库迁移 |
+| `npm run db:migrate` | 执行本地 D1 数据库迁移 |
+| `npm run db:migrate:remote` | 执行线上 D1 数据库迁移 |
 | `npm run test` | 运行测试 |
 | `npm run typecheck` | TypeScript 类型检查 |
 

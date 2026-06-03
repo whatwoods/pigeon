@@ -453,6 +453,9 @@ input:focus-visible {
   display: flex;
   flex-direction: column;
   justify-content: center;
+  align-items: center;
+  text-align: center;
+  margin-bottom: 32px;
   min-width: 0;
 }
 
@@ -506,6 +509,10 @@ input:focus-visible {
   stroke-width: 1.45;
 }
 
+.preview-body .file-icon {
+  margin-bottom: 14px;
+}
+
 .preview-body h2,
 .share-body h2,
 .add-device-modal h2,
@@ -545,6 +552,9 @@ input:focus-visible {
 
 .text-preview {
   position: relative;
+  width: 100%;
+  box-sizing: border-box;
+  text-align: left;
   max-height: 164px;
   overflow: hidden;
   padding: 20px;
