@@ -1,0 +1,113 @@
+import type { PackageEntry, PackageManifest } from "../shared/protocol";
+
+export interface ReceiveSink {
+  startFile(entry: PackageEntry): Promise<void>;
+  writeChunk(entry: PackageEntry, bytes: Uint8Array): Promise<void>;
+  finishFile(entry: PackageEntry): Promise<void>;
+  finishPackage(): Promise<void>;
+}
+
+export async function createReceiveSink(manifest: PackageManifest): Promise<{ sink: ReceiveSink; mode: "directory" | "download" }> {
+  const picker = (window as Window & {
+    showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<FileSystemDirectoryHandle>;
+  }).showDirectoryPicker;
+
+  if (picker) {
+    try {
+      const directory = await picker({ mode: "readwrite" });
+      return { sink: new DirectoryReceiveSink(directory), mode: "directory" };
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw error;
+      }
+    }
+  }
+
+  return { sink: new DownloadReceiveSink(manifest), mode: "download" };
+}
+
+class DirectoryReceiveSink implements ReceiveSink {
+  private writable?: FileSystemWritableFileStream;
+  private currentPath?: string;
+
+  constructor(private readonly root: FileSystemDirectoryHandle) {}
+
+  async startFile(entry: PackageEntry): Promise<void> {
+    if (this.writable && this.currentPath === entry.relativePath) return;
+    await this.writable?.close();
+    const fileHandle = await this.resolveFile(entry.relativePath);
+    this.writable = await fileHandle.createWritable();
+    this.currentPath = entry.relativePath;
+  }
+
+  async writeChunk(_entry: PackageEntry, bytes: Uint8Array): Promise<void> {
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    await this.writable?.write(copy.buffer);
+  }
+
+  async finishFile(): Promise<void> {
+    await this.writable?.close();
+    this.writable = undefined;
+    this.currentPath = undefined;
+  }
+
+  async finishPackage(): Promise<void> {
+    await this.writable?.close();
+    this.writable = undefined;
+    this.currentPath = undefined;
+  }
+
+  private async resolveFile(path: string): Promise<FileSystemFileHandle> {
+    const parts = path.split("/").filter(Boolean);
+    const fileName = parts.pop() || "download";
+    let directory = this.root;
+    for (const part of parts) {
+      directory = await directory.getDirectoryHandle(part, { create: true });
+    }
+    return directory.getFileHandle(fileName, { create: true });
+  }
+}
+
+class DownloadReceiveSink implements ReceiveSink {
+  private chunks: Uint8Array[] = [];
+  private current?: PackageEntry;
+
+  constructor(private readonly manifest: PackageManifest) {}
+
+  async startFile(entry: PackageEntry): Promise<void> {
+    if (this.current?.id === entry.id) return;
+    this.current = entry;
+    this.chunks = [];
+  }
+
+  async writeChunk(_entry: PackageEntry, bytes: Uint8Array): Promise<void> {
+    this.chunks.push(bytes);
+  }
+
+  async finishFile(entry: PackageEntry): Promise<void> {
+    const blob = new Blob(
+      this.chunks.map((chunk) => {
+        const copy = new Uint8Array(chunk.byteLength);
+        copy.set(chunk);
+        return copy.buffer;
+      }),
+      { type: entry.mime || "application/octet-stream" }
+    );
+    const anchor = document.createElement("a");
+    anchor.href = URL.createObjectURL(blob);
+    anchor.download = entry.relativePath.includes("/") ? entry.relativePath.replaceAll("/", "_") : entry.name;
+    anchor.click();
+    setTimeout(() => URL.revokeObjectURL(anchor.href), 10_000);
+    this.current = undefined;
+    this.chunks = [];
+  }
+
+  async finishPackage(): Promise<void> {
+    document.dispatchEvent(
+      new CustomEvent("pigeon:download-complete", {
+        detail: { packageId: this.manifest.packageId }
+      })
+    );
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "Pigeon",
+  "description": "A light organic minimalist P2P file and clipboard transfer tool.",
+  "requestFramePermissions": [
+    "clipboard-read",
+    "clipboard-write"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

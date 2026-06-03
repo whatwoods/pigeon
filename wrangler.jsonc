@@ -1,0 +1,48 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pigeon",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-06-02",
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PAIR_ROOM",
+        "class_name": "PairRoom"
+      },
+      {
+        "name": "DEVICE_ROOM",
+        "class_name": "DeviceRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["AccountRoom", "PairRoom"]
+    },
+    {
+      "tag": "v2",
+      "deleted_classes": ["AccountRoom"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["DeviceRoom"]
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "pigeon",
+      "database_id": "536dd70d-3e72-4118-843d-c3ea2e7e4e9d"
+    }
+  ],
+  "vars": {}
+}
