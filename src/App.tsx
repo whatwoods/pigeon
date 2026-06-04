@@ -22,7 +22,7 @@ import { FileVisual } from "./FileVisual";
 import { formatBytes, formatCount } from "./lib/format";
 import { PackageReceiver, PackageSender, type ConnectionRoute, type ProgressEvent } from "./lib/peerTransfer";
 import { createReceiveSink } from "./lib/receiveSink";
-import { loadRoomSession, saveRoomSession, type StoredRoomSession } from "./lib/roomIdentity";
+import { clearRoomSession, loadRoomSession, saveRoomSession, type StoredRoomSession } from "./lib/roomIdentity";
 import { openSignalSocket, type SignalSocket } from "./lib/signaling";
 import type {
   PackageAcceptMessage,
@@ -134,7 +134,7 @@ export default function App() {
         if (urlPairCode) {
           setReceiveCode(urlPairCode.toUpperCase());
           setView("enter_code");
-          connectPairReceiver(urlPairCode, nextIdentity);
+          connectPairReceiver(urlPairCode.toUpperCase(), nextIdentity);
         }
       })
       .catch((error) => {
@@ -163,7 +163,17 @@ export default function App() {
     }
 
     const existing = loadRoomSession(nextIdentity);
-    if (existing) return existing;
+    if (existing) {
+      try {
+        const res = await api.verifyRoom(existing.roomId, existing.roomToken, existing.deviceId);
+        if (res.valid) {
+          return existing;
+        }
+        clearRoomSession();
+      } catch (error) {
+        throw error;
+      }
+    }
 
     const created = await api.createRoom(registrationPayload(nextIdentity));
     const session = { roomId: created.roomId, roomToken: created.roomToken, deviceId: created.deviceId };

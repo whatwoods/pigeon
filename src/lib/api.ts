@@ -42,6 +42,12 @@ export const api = {
       body: JSON.stringify({ roomId, roomToken })
     });
   },
+  verifyRoom(roomId: string, roomToken: string, deviceId: string) {
+    return request<{ valid: boolean }>("/api/rooms/verify", {
+      method: "POST",
+      body: JSON.stringify({ roomId, roomToken, deviceId })
+    });
+  },
   createPair() {
     return request<PairCreateResponse>("/api/pairs", {
       method: "POST",

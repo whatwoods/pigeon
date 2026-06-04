@@ -23,6 +23,11 @@ export async function createReceiveSink(manifest: PackageManifest): Promise<{ si
     }
   }
 
+  // OOM block: check if multi-file package exceeds 500MB threshold in download fallback mode
+  if (manifest.entries.length > 1 && manifest.totalBytes > 500 * 1024 * 1024) {
+    throw new Error("由于您的浏览器不支持直接写入文件夹，且总大小超过 500MB，为防止内存崩溃，请使用 Chrome 等支持目录访问的桌面浏览器，或分开传输。");
+  }
+
   return { sink: new DownloadReceiveSink(manifest), mode: "download" };
 }
 
@@ -70,6 +75,7 @@ class DirectoryReceiveSink implements ReceiveSink {
 }
 
 class DownloadReceiveSink implements ReceiveSink {
+  private fileDataMap = new Map<string, { entry: PackageEntry; data: Uint8Array }>();
   private chunks: Uint8Array[] = [];
   private current?: PackageEntry;
 
@@ -86,24 +92,55 @@ class DownloadReceiveSink implements ReceiveSink {
   }
 
   async finishFile(entry: PackageEntry): Promise<void> {
-    const blob = new Blob(
-      this.chunks.map((chunk) => {
-        const copy = new Uint8Array(chunk.byteLength);
-        copy.set(chunk);
-        return copy.buffer;
-      }),
-      { type: entry.mime || "application/octet-stream" }
-    );
-    const anchor = document.createElement("a");
-    anchor.href = URL.createObjectURL(blob);
-    anchor.download = entry.relativePath.includes("/") ? entry.relativePath.replaceAll("/", "_") : entry.name;
-    anchor.click();
-    setTimeout(() => URL.revokeObjectURL(anchor.href), 10_000);
+    const totalLength = this.chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    const fileBytes = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of this.chunks) {
+      fileBytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    if (this.manifest.entries.length > 1) {
+      this.fileDataMap.set(entry.id, { entry, data: fileBytes });
+    } else {
+      const blob = new Blob([fileBytes.buffer], { type: entry.mime || "application/octet-stream" });
+      const anchor = document.createElement("a");
+      anchor.href = URL.createObjectURL(blob);
+      anchor.download = entry.name;
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(anchor.href), 10_000);
+    }
     this.current = undefined;
     this.chunks = [];
   }
 
   async finishPackage(): Promise<void> {
+    if (this.manifest.entries.length > 1 && this.fileDataMap.size > 0) {
+      const { zip } = await import("fflate");
+      const zipObject: Record<string, Uint8Array> = {};
+      for (const [_, item] of this.fileDataMap) {
+        zipObject[item.entry.relativePath] = item.data;
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        zip(zipObject, (err, data) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+          const blob = new Blob([data.buffer], { type: "application/zip" });
+          const anchor = document.createElement("a");
+          anchor.href = URL.createObjectURL(blob);
+          anchor.download = `${this.manifest.name}.zip`;
+          anchor.click();
+          setTimeout(() => URL.revokeObjectURL(anchor.href), 10_000);
+          resolve();
+        });
+      });
+
+      this.fileDataMap.clear();
+    }
+
     document.dispatchEvent(
       new CustomEvent("pigeon:download-complete", {
         detail: { packageId: this.manifest.packageId }

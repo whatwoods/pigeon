@@ -25,6 +25,20 @@ export class PairRoom extends DurableObject<Env> {
     const deviceId = url.searchParams.get("deviceId") || crypto.randomUUID();
     if (role !== "sender" && role !== "receiver") return new Response("Missing role", { status: 400 });
 
+    const sockets = this.ctx.getWebSockets();
+    for (const socket of sockets) {
+      const attach = socket.deserializeAttachment() as Attachment | null;
+      if (attach?.role === role) {
+        if (attach.deviceId !== deviceId) {
+          return new Response(`${role} slot already claimed`, { status: 409 });
+        } else {
+          try {
+            socket.close(1000, "Replaced by new connection");
+          } catch {}
+        }
+      }
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     server.serializeAttachment({ deviceId, role } satisfies Attachment);
@@ -60,12 +74,20 @@ export class PairRoom extends DurableObject<Env> {
       if (targetDeviceId && target.deviceId !== targetDeviceId) continue;
 
       if (message.type === "package:offer" && target.role === "receiver") {
-        socket.send(JSON.stringify(message));
+        try {
+          socket.send(JSON.stringify(message));
+        } catch {
+          socket.close(1011, "Route failed");
+        }
         continue;
       }
 
       if (message.type !== "package:offer") {
-        socket.send(JSON.stringify(message));
+        try {
+          socket.send(JSON.stringify(message));
+        } catch {
+          socket.close(1011, "Route failed");
+        }
       }
     }
   }

@@ -50,6 +50,16 @@ app.post("/api/rooms/join", async (c) => {
   return c.json({ roomId: invite.room_id, roomToken, deviceId: device.deviceId });
 });
 
+app.post("/api/rooms/verify", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!isRecord(body) || typeof body.roomId !== "string" || typeof body.roomToken !== "string" || typeof body.deviceId !== "string") {
+    return c.json({ error: "参数无效" }, 400);
+  }
+
+  const device = await authenticateRoomDevice(c.env, body.roomId, body.roomToken, body.deviceId);
+  return c.json({ valid: !!device });
+});
+
 app.post("/api/rooms/invites", async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!isRecord(body) || typeof body.roomId !== "string" || typeof body.roomToken !== "string") {
@@ -79,6 +89,15 @@ app.post("/api/pairs", async (c) => {
   await c.env.DB.prepare("INSERT INTO pair_rooms (code, expires_at, created_at) VALUES (?, ?, ?)")
     .bind(await sha256Hex(code), expiresAt, Date.now())
     .run();
+
+  // Async cleanup of expired records
+  c.executionCtx.waitUntil(
+    Promise.all([
+      c.env.DB.prepare("DELETE FROM pair_rooms WHERE expires_at < ?").bind(Date.now()).run(),
+      c.env.DB.prepare("DELETE FROM room_invites WHERE expires_at < ?").bind(Date.now()).run(),
+      c.env.DB.prepare("DELETE FROM pair_attempts WHERE timestamp < ?").bind(Date.now() - 60000).run()
+    ]).catch(() => {})
+  );
 
   const origin = c.env.APP_ORIGIN || new URL(c.req.url).origin;
   return c.json({
@@ -119,15 +138,61 @@ app.get("/api/turn", (c) => {
 });
 
 app.get("/ws/pair/:code", async (c) => {
-  const code = c.req.param("code");
+  const code = c.req.param("code").toUpperCase();
   const role = c.req.query("role");
+
+  // Validate extracting code format
+  if (!/^[2-9A-Z]{6}$/.test(code)) {
+    return c.text("Invalid pair code format", 400);
+  }
+
+  const ip = c.req.header("CF-Connecting-IP") || "127.0.0.1";
+  const now = Date.now();
+
+  // Rate limiting lookup
+  const attempts = await c.env.DB.prepare(
+    "SELECT COUNT(*) as count FROM pair_attempts WHERE ip = ? AND timestamp > ?"
+  )
+    .bind(ip, now - 60000)
+    .first<{ count: number }>();
+
+  if (attempts && attempts.count >= 5) {
+    return c.text("Too many failed attempts. Please try again in a minute.", 429);
+  }
+
+  const codeHash = await sha256Hex(code);
   const row = await c.env.DB.prepare("SELECT expires_at FROM pair_rooms WHERE code = ?")
-    .bind(await sha256Hex(code))
+    .bind(codeHash)
     .first<{ expires_at: number }>();
-  if (!row || row.expires_at < Date.now()) return c.text("Pair code expired", 404);
+
+  if (!row || row.expires_at < now) {
+    // Record failed attempt
+    await c.env.DB.prepare("INSERT INTO pair_attempts (ip, timestamp) VALUES (?, ?)")
+      .bind(ip, now)
+      .run();
+
+    c.executionCtx.waitUntil(
+      Promise.all([
+        c.env.DB.prepare("DELETE FROM pair_rooms WHERE expires_at < ?").bind(now).run(),
+        c.env.DB.prepare("DELETE FROM room_invites WHERE expires_at < ?").bind(now).run(),
+        c.env.DB.prepare("DELETE FROM pair_attempts WHERE timestamp < ?").bind(now - 60000).run()
+      ]).catch(() => {})
+    );
+
+    return c.text("Pair code expired", 404);
+  }
+
   if (role !== "sender" && role !== "receiver") return c.text("Missing role", 400);
 
-  const id = c.env.PAIR_ROOM.idFromName(await sha256Hex(code));
+  c.executionCtx.waitUntil(
+    Promise.all([
+      c.env.DB.prepare("DELETE FROM pair_rooms WHERE expires_at < ?").bind(now).run(),
+      c.env.DB.prepare("DELETE FROM room_invites WHERE expires_at < ?").bind(now).run(),
+      c.env.DB.prepare("DELETE FROM pair_attempts WHERE timestamp < ?").bind(now - 60000).run()
+    ]).catch(() => {})
+  );
+
+  const id = c.env.PAIR_ROOM.idFromName(codeHash);
   const stub = c.env.PAIR_ROOM.get(id);
   return stub.fetch(c.req.raw);
 });
@@ -138,7 +203,9 @@ app.notFound((c) => {
 });
 
 function createPairCode(): string {
-  return randomToken(3).toUpperCase();
+  const chars = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  return Array.from(bytes).map((b) => chars[b % chars.length]).join("");
 }
 
 async function readDeviceRegistration(request: Request): Promise<DeviceRegistrationPayload> {
