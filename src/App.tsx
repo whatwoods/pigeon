@@ -178,6 +178,45 @@ export default function App() {
     };
   }, [urlPairCode, urlRoomInvite]);
 
+  const prevOnlineDevicesRef = useRef<RoomDevicePresence[]>([]);
+  const hasInitializedPresence = useRef(false);
+  const prevRoomIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const currentRoomId = roomSession?.roomId || null;
+    if (currentRoomId !== prevRoomIdRef.current) {
+      prevRoomIdRef.current = currentRoomId;
+      hasInitializedPresence.current = false;
+      prevOnlineDevicesRef.current = [];
+    }
+
+    if (!currentRoomId) return;
+
+    if (!hasInitializedPresence.current) {
+      if (onlineDevices.length > 0) {
+        hasInitializedPresence.current = true;
+        prevOnlineDevicesRef.current = onlineDevices;
+      }
+      return;
+    }
+
+    const prev = prevOnlineDevicesRef.current;
+    const currentOthers = onlineDevices.filter((d) => d.deviceId !== identity?.deviceId);
+    const prevOthers = prev.filter((d) => d.deviceId !== identity?.deviceId);
+
+    const newOthers = currentOthers.filter(
+      (curr) => !prevOthers.some((p) => p.deviceId === curr.deviceId)
+    );
+
+    if (newOthers.length > 0) {
+      newOthers.forEach((device) => {
+        showToast(`${device.deviceName} 已上线`, "success");
+      });
+    }
+
+    prevOnlineDevicesRef.current = onlineDevices;
+  }, [onlineDevices, roomSession?.roomId, identity?.deviceId, showToast]);
+
   async function ensureRoom(nextIdentity: DeviceIdentity): Promise<StoredRoomSession> {
     if (urlRoomInvite) {
       const joined = await api.joinRoom(urlRoomInvite, registrationPayload(nextIdentity));
