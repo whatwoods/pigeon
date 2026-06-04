@@ -46,6 +46,7 @@ export class PackageSender {
   private retryTimer?: ReturnType<typeof window.setTimeout>;
   private sendingRun = 0;
   private pendingResume?: (state: ResumeState) => void;
+  private pendingIce: RtcIceMessage[] = [];
   private closingPeer = false;
 
   constructor(
@@ -70,13 +71,20 @@ export class PackageSender {
   }
 
   async handleAnswer(message: RtcAnswerMessage): Promise<void> {
-    if (!this.pc || this.pc.signalingState === "closed") return;
-    await this.pc.setRemoteDescription(message.description as RTCSessionDescriptionInit);
+    const pc = this.pc;
+    if (!pc || pc.signalingState === "closed") return;
+    await pc.setRemoteDescription(message.description as RTCSessionDescriptionInit);
+    await this.flushPendingIce(pc);
   }
 
   async handleIce(message: RtcIceMessage): Promise<void> {
-    if (!this.pc || this.pc.signalingState === "closed") return;
-    await this.pc.addIceCandidate(message.candidate as RTCIceCandidateInit).catch(() => undefined);
+    const pc = this.pc;
+    if (!pc || pc.signalingState === "closed") return;
+    if (!pc.remoteDescription) {
+      this.pendingIce.push(message);
+      return;
+    }
+    await this.addIceCandidate(pc, message);
   }
 
   cancel(): void {
@@ -98,6 +106,7 @@ export class PackageSender {
     this.pc = pc;
     this.channel = channel;
     this.connectionRoute = undefined;
+    this.pendingIce = [];
 
     channel.binaryType = "arraybuffer";
     channel.bufferedAmountLowThreshold = DATA_CHANNEL_BUFFER_LIMIT / 2;
@@ -268,6 +277,7 @@ export class PackageSender {
 
   private closePeer(): void {
     this.pendingResume = undefined;
+    this.pendingIce = [];
     this.closingPeer = true;
     this.channel?.close();
     this.pc?.close();
@@ -296,6 +306,18 @@ export class PackageSender {
     this.connectionRoute = route;
     this.options.onConnectionRoute?.(route);
   }
+
+  private async flushPendingIce(pc: RTCPeerConnection): Promise<void> {
+    const pending = this.pendingIce.splice(0);
+    for (const message of pending) {
+      if (this.pc !== pc || pc.signalingState === "closed") return;
+      await this.addIceCandidate(pc, message);
+    }
+  }
+
+  private async addIceCandidate(pc: RTCPeerConnection, message: RtcIceMessage): Promise<void> {
+    await pc.addIceCandidate(message.candidate as RTCIceCandidateInit).catch(() => undefined);
+  }
 }
 
 export class PackageReceiver {
@@ -308,6 +330,7 @@ export class PackageReceiver {
   private channel?: RTCDataChannel;
   private receivedChunks = new Map<string, number>();
   private finishedEntries = new Set<string>();
+  private pendingIce: RtcIceMessage[] = [];
 
   constructor(
     private readonly options: {
@@ -335,6 +358,7 @@ export class PackageReceiver {
     const pc = this.pc;
     if (!pc) return;
     await pc.setRemoteDescription(message.description as RTCSessionDescriptionInit);
+    await this.flushPendingIce(pc);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     this.options.signal({
@@ -347,8 +371,13 @@ export class PackageReceiver {
   }
 
   async handleIce(message: RtcIceMessage): Promise<void> {
-    if (!this.pc || this.pc.signalingState === "closed") return;
-    await this.pc.addIceCandidate(message.candidate as RTCIceCandidateInit).catch(() => undefined);
+    const pc = this.pc;
+    if (!pc || pc.signalingState === "closed") return;
+    if (!pc.remoteDescription) {
+      this.pendingIce.push(message);
+      return;
+    }
+    await this.addIceCandidate(pc, message);
   }
 
   close(): void {
@@ -359,6 +388,7 @@ export class PackageReceiver {
   private createPeer(): void {
     this.channel?.close();
     this.pc?.close();
+    this.pendingIce = [];
     const pc = new RTCPeerConnection({ iceServers: this.options.iceServers });
     this.pc = pc;
 
@@ -479,6 +509,18 @@ export class PackageReceiver {
     if (this.connectionRoute === route) return;
     this.connectionRoute = route;
     this.options.onConnectionRoute?.(route);
+  }
+
+  private async flushPendingIce(pc: RTCPeerConnection): Promise<void> {
+    const pending = this.pendingIce.splice(0);
+    for (const message of pending) {
+      if (this.pc !== pc || pc.signalingState === "closed") return;
+      await this.addIceCandidate(pc, message);
+    }
+  }
+
+  private async addIceCandidate(pc: RTCPeerConnection, message: RtcIceMessage): Promise<void> {
+    await pc.addIceCandidate(message.candidate as RTCIceCandidateInit).catch(() => undefined);
   }
 }
 

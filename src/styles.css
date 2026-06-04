@@ -79,7 +79,6 @@ input:focus-visible {
   height: 100%;
   opacity: 0.04;
   pointer-events: none;
-  mix-blend-mode: overlay;
 }
 
 .organic-bg {
@@ -827,6 +826,92 @@ input:focus-visible {
 
 .add-device-modal .qr-container {
   margin: 0 auto 24px;
+}
+
+.room-modal {
+  align-items: stretch;
+  gap: 18px;
+  text-align: left;
+}
+
+.room-device-list {
+  display: grid;
+  gap: 8px;
+}
+
+.room-device-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.66);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.46);
+}
+
+.room-device-icon {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: rgba(232, 229, 224, 0.68);
+  color: rgba(74, 73, 71, 0.72);
+}
+
+.room-device-icon svg {
+  width: 17px;
+  height: 17px;
+}
+
+.room-device-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-device-status {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.room-invite-block {
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+  padding-top: 4px;
+}
+
+.room-invite-block .qr-container {
+  width: 160px;
+  height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+}
+
+.qr-placeholder {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.room-actions {
+  width: 100%;
+  margin-top: 0;
+}
+
+.room-reset-action {
+  width: 100%;
 }
 
 .modal-close {

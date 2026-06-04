@@ -14,6 +14,8 @@ import {
   Tablet,
   Monitor,
   AlertTriangle,
+  RefreshCw,
+  Users,
   X
 } from "lucide-react";
 import QRCode from "qrcode";
@@ -778,13 +780,42 @@ export default function App() {
   }
 
   async function createDeviceInvite() {
+    setCopiedLink(false);
+    setShowAddDevice(true);
     if (!roomSession) return;
     try {
       const invite = await api.createRoomInvite(roomSession.roomId, roomSession.roomToken);
       setDeviceInviteUrl(invite.url);
-      setShowAddDevice(true);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "无法创建设备链接");
+    }
+  }
+
+  async function createFreshRoom() {
+    if (!identity) return;
+    try {
+      stopOfferResend();
+      closePairSession();
+      activeSenders.current.forEach((sender) => sender.cancel());
+      activeSenders.current.clear();
+      activeReceiver.current?.close();
+      activeReceiver.current = null;
+      roomSocketRef.current?.close();
+      clearRoomSession();
+      setOnlineDevices([]);
+      setDeviceInviteUrl("");
+      setStatus("正在创建新房间");
+
+      const created = await api.createRoom(registrationPayload(identity));
+      const session = { roomId: created.roomId, roomToken: created.roomToken, deviceId: created.deviceId };
+      saveRoomSession(session);
+      setRoomSession(session);
+      connectRoom(session, identity);
+      setShowAddDevice(false);
+      showToast("已进入新房间", "success");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "无法创建新房间");
+      setView("error");
     }
   }
 
@@ -912,8 +943,12 @@ export default function App() {
         {showAddDevice ? (
           <AddDeviceModal
             inviteUrl={deviceInviteUrl}
+            identity={identity}
+            onlineDevices={onlineDevices}
             copied={copiedLink}
             onCopy={() => deviceInviteUrl && copyValue(deviceInviteUrl, "link")}
+            onRefreshInvite={createDeviceInvite}
+            onCreateRoom={createFreshRoom}
             onClose={() => setShowAddDevice(false)}
           />
         ) : null}
@@ -1384,16 +1419,29 @@ function ErrorCard({ status, onClose }: { status: string; onClose: () => void })
 
 function AddDeviceModal({
   inviteUrl,
+  identity,
+  onlineDevices,
   copied,
   onCopy,
+  onRefreshInvite,
+  onCreateRoom,
   onClose
 }: {
   inviteUrl: string;
+  identity: DeviceIdentity | null;
+  onlineDevices: RoomDevicePresence[];
   copied: boolean;
   onCopy: () => void;
+  onRefreshInvite: () => void;
+  onCreateRoom: () => void;
   onClose: () => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const devices = onlineDevices.length > 0
+    ? onlineDevices
+    : identity
+      ? [{ deviceId: identity.deviceId, deviceName: identity.deviceName }]
+      : [];
 
   useEffect(() => {
     if (inviteUrl && canvasRef.current) {
@@ -1411,17 +1459,43 @@ function AddDeviceModal({
   return (
     <div className="modal-layer">
       <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} />
-      <motion.div className="add-device-modal" initial={{ opacity: 0, y: 20, scale: 0.95 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 20, scale: 0.95 }}>
-        <button className="modal-close icon-button" onClick={onClose} aria-label="关闭"><X /></button>
-        <h2>连接新设备</h2>
-        <p>使用手机扫码，或复制链接在其他设备打开</p>
-        <div className="qr-container">
-          <canvas ref={canvasRef} />
+      <motion.div className="add-device-modal room-modal" initial={{ opacity: 0, y: 20, scale: 0.95 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 20, scale: 0.95 }}>
+        
+        <div className="panel-title" style={{ marginBottom: "8px" }}>
+          <div><span>邀请设备加入</span></div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭"><X /></button>
         </div>
-        <button className="primary-action" onClick={onCopy} disabled={!inviteUrl}>
-          {copied ? <Check /> : <Copy />}
-          <span>{copied ? "已复制链接" : "复制房间链接"}</span>
+
+        <div className="room-invite-block" style={{ marginBottom: "8px" }}>
+          <div className="qr-container">
+            {inviteUrl ? <canvas ref={canvasRef} /> : <span className="qr-placeholder">生成链接中</span>}
+          </div>
+          <div className="split-actions room-actions">
+            <button className="soft-action" onClick={onRefreshInvite}>
+              <RefreshCw />
+              <span>刷新链接</span>
+            </button>
+            <button className="primary-action" onClick={onCopy} disabled={!inviteUrl}>
+              {copied ? <Check /> : <Copy />}
+              <span>{copied ? "已复制" : "复制链接"}</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="room-device-list">
+          {devices.map((device) => (
+            <div className="room-device-row" key={device.deviceId}>
+              <span className="room-device-icon">{getDeviceIcon(inferDeviceType(device.deviceName))}</span>
+              <span className="room-device-name" title={device.deviceName}>{device.deviceName}</span>
+              <span className="room-device-status">{device.deviceId === identity?.deviceId ? "本机" : "在线"}</span>
+            </div>
+          ))}
+        </div>
+
+        <button className="soft-action room-reset-action" onClick={onCreateRoom} style={{ marginTop: "4px" }}>
+          <span>退出房间 / 新建连接</span>
         </button>
+
       </motion.div>
     </div>
   );
