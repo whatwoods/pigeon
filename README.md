@@ -4,6 +4,17 @@
 
 无需账号，无需安装，打开浏览器即可在任意设备间传输文件和文本。
 
+## 界面预览
+
+| 房间模式 (Room Mode) | 配对模式 (Pair Mode) |
+| :---: | :---: |
+| ![房间模式](docs/screenshots/room_mode.svg) | ![配对模式](docs/screenshots/pair_mode.svg) |
+
+### 动态演示
+
+![文件传输演示](docs/screenshots/file_transfer.svg)
+
+
 ## 特性
 
 - **端到端加密** — 基于 ECDH (P-256) 密钥协商 + AES-256-GCM 加密，服务器无法窥探传输内容
@@ -14,6 +25,7 @@
   - **配对模式** — 生成 6 位配对码或链接，分享给他人即可传输
 - **PWA 支持** — 可安装到桌面/主屏，支持离线缓存
 - **拖拽 & 粘贴** — 支持拖放文件、剪贴板粘贴、文件选择器
+- **现代 UI 设计** — 毛玻璃效果 (Glassmorphism)、流畅的微交互、自适应深浅色系统图标
 
 ## 技术栈
 
@@ -53,8 +65,9 @@ pigeon/
 ├── migrations/             # D1 数据库迁移
 └── public/
     ├── manifest.webmanifest
+    ├── favicon.svg         # 网站标签页图标 (自适应暗色模式)
     ├── sw.js               # Service Worker
-    └── pigeon-icon.svg
+    └── pigeon-icon.svg     # PWA 桌面主屏图标
 ```
 
 ## 快速开始
