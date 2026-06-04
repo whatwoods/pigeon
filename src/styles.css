@@ -10,13 +10,13 @@
   -webkit-font-smoothing: antialiased;
   --paper: #faf9f6;
   --ink: #4a4947;
-  --muted: rgba(74, 73, 71, 0.62);
+  --muted: rgba(74, 73, 71, 0.72);
   --line: rgba(232, 229, 224, 0.72);
-  --glass: rgba(255, 255, 255, 0.7);
+  --glass: rgba(255, 255, 255, 0.82);
   --green: #567d56;
   --blue: #6b9ab8;
   --soft: #e8e5e0;
-  --shadow: 0 24px 48px rgba(30, 30, 30, 0.04), inset 0 2px 4px rgba(255, 255, 255, 0.8);
+  --shadow: 0 24px 52px rgba(30, 30, 30, 0.08), inset 0 2px 4px rgba(255, 255, 255, 0.82);
 }
 
 * {
@@ -74,10 +74,11 @@ input:focus-visible {
 .noise-overlay {
   position: fixed;
   inset: 0;
-  z-index: 50;
+  z-index: 1;
   width: 100%;
   height: 100%;
-  opacity: 0.04;
+  opacity: 0.045;
+  mix-blend-mode: multiply;
   pointer-events: none;
 }
 
@@ -104,7 +105,7 @@ input:focus-visible {
   width: min(120vw, 900px);
   height: min(120vw, 900px);
   background: rgba(234, 229, 217, 0.42);
-  filter: blur(120px);
+  filter: blur(80px);
   transform: translate(-25%, -25%);
 }
 
@@ -112,7 +113,7 @@ input:focus-visible {
   width: min(100vw, 700px);
   height: min(100vw, 700px);
   background: rgba(213, 224, 236, 0.42);
-  filter: blur(100px);
+  filter: blur(72px);
   transform: translate(25%, 25%);
 }
 
@@ -120,7 +121,7 @@ input:focus-visible {
   width: min(80vw, 500px);
   height: min(80vw, 500px);
   background: rgba(255, 255, 255, 0.42);
-  filter: blur(80px);
+  filter: blur(56px);
 }
 
 .topbar {
@@ -183,9 +184,9 @@ input:focus-visible {
   padding: 0 12px;
   border: 1px solid rgba(255, 255, 255, 0.62);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.52);
+  background: rgba(255, 255, 255, 0.72);
   color: var(--ink);
-  box-shadow: inset 0 2px 4px rgba(255, 255, 255, 1);
+  box-shadow: 0 8px 18px rgba(30, 30, 30, 0.04), inset 0 2px 4px rgba(255, 255, 255, 1);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -291,7 +292,7 @@ input:focus-visible {
 .panel-title > span,
 .panel-title > div > span {
   margin: 0;
-  color: rgba(74, 73, 71, 0.58);
+  color: rgba(74, 73, 71, 0.72);
   font-size: 11px;
   font-weight: 800;
   letter-spacing: 0.2em;
@@ -300,7 +301,7 @@ input:focus-visible {
 
 .card-intro p {
   margin: 8px 0 0;
-  color: rgba(74, 73, 71, 0.7);
+  color: rgba(74, 73, 71, 0.84);
   font-family: "Playfair Display", ui-serif, Georgia, serif;
   font-size: 14px;
   font-style: italic;
@@ -344,7 +345,7 @@ input:focus-visible {
 .file-orb svg {
   width: 40px;
   height: 40px;
-  opacity: 0.72;
+  opacity: 0.86;
   stroke-width: 1.5;
 }
 
@@ -353,7 +354,7 @@ input:focus-visible {
   font-weight: 800;
   letter-spacing: 0.2em;
   text-transform: uppercase;
-  opacity: 0.62;
+  opacity: 0.78;
 }
 
 .card-actions {
@@ -384,9 +385,9 @@ input:focus-visible {
 
 .soft-action {
   border: 1px solid rgba(232, 229, 224, 0.66);
-  background: rgba(255, 255, 255, 0.42);
+  background: rgba(255, 255, 255, 0.68);
   color: var(--ink);
-  box-shadow: inset 0 2px 4px rgba(255, 255, 255, 0.8);
+  box-shadow: 0 8px 18px rgba(30, 30, 30, 0.04), inset 0 2px 4px rgba(255, 255, 255, 0.86);
 }
 
 .soft-action:hover {
@@ -464,7 +465,7 @@ input:focus-visible {
   justify-content: center;
   margin: -8px -8px 0 0;
   background: transparent;
-  color: rgba(74, 73, 71, 0.48);
+  color: rgba(74, 73, 71, 0.64);
 }
 
 .icon-button:hover {
@@ -604,7 +605,7 @@ input:focus-visible {
   border: 1px solid rgba(255, 255, 255, 0.72);
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.52);
-  color: rgba(74, 73, 71, 0.82);
+  color: rgba(74, 73, 71, 0.9);
   box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.02);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
@@ -914,6 +915,17 @@ input:focus-visible {
   width: 100%;
 }
 
+.danger-action {
+  border-color: rgba(159, 51, 41, 0.22);
+  background: rgba(159, 51, 41, 0.07);
+  color: #8f2f27;
+}
+
+.danger-action:hover {
+  background: rgba(159, 51, 41, 0.11);
+  color: #7a251f;
+}
+
 .modal-close {
   position: absolute;
   top: 16px;
@@ -975,7 +987,7 @@ input:focus-visible {
   display: flex;
   justify-content: center;
   gap: 14px;
-  color: rgba(74, 73, 71, 0.48);
+  color: rgba(74, 73, 71, 0.64);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.16em;
@@ -1201,6 +1213,12 @@ input:focus-visible {
 
   .success-icon.error {
     background: rgba(159, 51, 41, 0.15);
+  }
+
+  .danger-action {
+    border-color: rgba(239, 126, 112, 0.26);
+    background: rgba(239, 126, 112, 0.12);
+    color: #f0a099;
   }
 
   .toast-alert {

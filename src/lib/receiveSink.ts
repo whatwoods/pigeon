@@ -100,22 +100,22 @@ class DownloadReceiveSink implements ReceiveSink {
       offset += chunk.byteLength;
     }
 
-    if (this.manifest.entries.length > 1) {
-      this.fileDataMap.set(entry.id, { entry, data: fileBytes });
-    } else {
-      const blob = new Blob([fileBytes.buffer], { type: entry.mime || "application/octet-stream" });
-      const anchor = document.createElement("a");
-      anchor.href = URL.createObjectURL(blob);
-      anchor.download = entry.name;
-      anchor.click();
-      setTimeout(() => URL.revokeObjectURL(anchor.href), 10_000);
-    }
+    this.fileDataMap.set(entry.id, { entry, data: fileBytes });
     this.current = undefined;
     this.chunks = [];
   }
 
   async finishPackage(): Promise<void> {
-    if (this.manifest.entries.length > 1 && this.fileDataMap.size > 0) {
+    if (this.manifest.entries.length === 1) {
+      const item = this.fileDataMap.values().next().value;
+      if (item) {
+        triggerDownload(
+          new Blob([toArrayBuffer(item.data)], { type: item.entry.mime || "application/octet-stream" }),
+          item.entry.name
+        );
+      }
+      this.fileDataMap.clear();
+    } else if (this.fileDataMap.size > 0) {
       const { zip } = await import("fflate");
       const zipObject: Record<string, Uint8Array> = {};
       for (const [_, item] of this.fileDataMap) {
@@ -128,12 +128,7 @@ class DownloadReceiveSink implements ReceiveSink {
             reject(err);
             return;
           }
-          const blob = new Blob([data.buffer], { type: "application/zip" });
-          const anchor = document.createElement("a");
-          anchor.href = URL.createObjectURL(blob);
-          anchor.download = `${this.manifest.name}.zip`;
-          anchor.click();
-          setTimeout(() => URL.revokeObjectURL(anchor.href), 10_000);
+          triggerDownload(new Blob([toArrayBuffer(data)], { type: "application/zip" }), `${this.manifest.name}.zip`);
           resolve();
         });
       });
@@ -147,4 +142,16 @@ class DownloadReceiveSink implements ReceiveSink {
       })
     );
   }
+}
+
+function triggerDownload(blob: Blob, name: string): void {
+  const anchor = document.createElement("a");
+  anchor.href = URL.createObjectURL(blob);
+  anchor.download = name;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(anchor.href), 10_000);
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }

@@ -84,6 +84,7 @@ export interface TextOfferMessage {
   type: "text:offer";
   id: string;
   deliveryScope?: DeliveryScope;
+  targetDeviceId?: string;
   senderDeviceId: string;
   senderPublicKey: PublicJwk;
   createdAt: number;
@@ -219,6 +220,7 @@ export function isSignalMessage(value: unknown): value is SignalMessage {
       return (
         isString(value.id) &&
         isOptionalDeliveryScope(value.deliveryScope) &&
+        isOptionalString(value.targetDeviceId) &&
         isString(value.senderDeviceId) &&
         isRecord(value.senderPublicKey) &&
         isNumber(value.createdAt)

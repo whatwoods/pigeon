@@ -18,6 +18,7 @@ describe("signal message parsing", () => {
     const offer: SignalMessage = {
       type: "text:offer",
       id: "text-1",
+      targetDeviceId: "device-2",
       senderDeviceId: "device-1",
       senderPublicKey: publicKey,
       createdAt: 1

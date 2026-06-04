@@ -69,6 +69,7 @@ interface PendingTextSend {
   text: string;
   source: SignalSource;
   socket?: SignalSocket;
+  expectedReceiverIds?: Set<string>;
 }
 
 const EMPTY_TURN: TurnResponse = {
@@ -136,6 +137,7 @@ export default function App() {
   const activeReceiver = useRef<PackageReceiver | null>(null);
   const pendingText = useRef<PendingTextSend | null>(null);
   const packageSources = useRef(new Map<string, SignalSource>());
+  const pendingPackageTargets = useRef(new Map<string, Set<string>>());
   const offerTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const urlPairCode = useMemo(() => new URLSearchParams(window.location.search).get("code"), []);
@@ -292,7 +294,6 @@ export default function App() {
       }
 
       if (message.type === "text:accept") {
-        stopOfferResend();
         await sendPairedText(message);
         return;
       }
@@ -316,7 +317,7 @@ export default function App() {
       }
 
       if (message.type === "package:accept") {
-        stopOfferResend();
+        markPackageAccepted(message.packageId, message.receiverDeviceId);
         await beginSendingToReceiver(message);
         return;
       }
@@ -394,6 +395,7 @@ export default function App() {
     const currentIdentity = identityRef.current;
     const pending = pendingText.current;
     if (!currentIdentity || !pending || pending.id !== message.id) return;
+    if (pending.expectedReceiverIds && !pending.expectedReceiverIds.has(message.receiverDeviceId)) return;
 
     const key = await deriveAesKey(currentIdentity.privateKey, message.receiverPublicKey);
     const encrypted = await encryptText(pending.text, key);
@@ -408,6 +410,16 @@ export default function App() {
       createdAt: Date.now()
     };
     (pending.source === "room" ? roomSocketRef.current : pending.socket)?.send(payload);
+
+    if (pending.expectedReceiverIds) {
+      pending.expectedReceiverIds.delete(message.receiverDeviceId);
+      if (pending.expectedReceiverIds.size > 0) {
+        setStatus(`已送达一台设备，等待 ${pending.expectedReceiverIds.size} 台设备接收`);
+        return;
+      }
+    }
+
+    stopOfferResend();
     pendingText.current = null;
     setSendState("sent");
     setStatus("已送达");
@@ -420,6 +432,7 @@ export default function App() {
     try {
       closePairSession();
       pendingText.current = null;
+      pendingPackageTargets.current.clear();
       setClipboardText("");
       const nextPackage = await createLocalPackage(list, identity.deviceId);
       setLocalPackage(nextPackage);
@@ -474,6 +487,7 @@ export default function App() {
       }
       setClipboardText(text);
       setLocalPackage(null);
+      pendingPackageTargets.current.clear();
       setSendState("selected");
       setStatus("文本已就绪");
       setView("file_preview");
@@ -514,6 +528,7 @@ export default function App() {
       } else {
         setClipboardText(text);
         setLocalPackage(null);
+        pendingPackageTargets.current.clear();
         setView("file_preview");
         setStatus("文本已就绪");
       }
@@ -526,24 +541,19 @@ export default function App() {
   function sendToSelf() {
     if (!identity) return;
     if (otherOnlineDevices.length === 0) {
-      setStatus("没有其他在线设备");
+      setStatus("请先添加一台设备");
       setShowDeviceHint(true);
+      void createDeviceInvite();
       return;
     }
 
+    const targetDeviceIds = otherOnlineDevices.map((device) => device.deviceId);
+
     if (localPackage) {
-      const offer: PackageOfferMessage = {
-        type: "package:offer",
-        deliveryScope: "room",
-        packageId: localPackage.manifest.packageId,
-        senderDeviceId: identity.deviceId,
-        senderPublicKey: identity.publicKey,
-        manifest: localPackage.manifest,
-        createdAt: Date.now()
-      };
       packageSources.current.set(localPackage.manifest.packageId, "room");
-      roomSocketRef.current?.send(offer);
-      startOfferResend(() => roomSocketRef.current?.send(offer));
+      pendingPackageTargets.current.set(localPackage.manifest.packageId, new Set(targetDeviceIds));
+      sendRoomPackageOffers(localPackage, targetDeviceIds);
+      startOfferResend(() => sendRoomPackageOffers(localPackage));
       setSendState("waiting");
       setView("waiting");
       setStatus(`等待 ${otherOnlineDevices.length} 台设备接收`);
@@ -560,12 +570,52 @@ export default function App() {
         senderPublicKey: identity.publicKey,
         createdAt: Date.now()
       };
-      pendingText.current = { id: textId, text: clipboardText, source: "room" };
-      roomSocketRef.current?.send(offer);
-      startOfferResend(() => roomSocketRef.current?.send(offer));
+      pendingText.current = { id: textId, text: clipboardText, source: "room", expectedReceiverIds: new Set(targetDeviceIds) };
+      sendRoomTextOffers(offer, targetDeviceIds);
+      startOfferResend(() => sendRoomTextOffers(offer));
       setSendState("waiting");
       setView("waiting");
-      setStatus("等待其他设备接收文本");
+      setStatus(`等待 ${targetDeviceIds.length} 台设备接收文本`);
+    }
+  }
+
+  function sendRoomPackageOffers(nextPackage: LocalPackage, targetDeviceIds?: string[]) {
+    const currentIdentity = identityRef.current;
+    if (!currentIdentity) return;
+    const remaining = targetDeviceIds ?? [...(pendingPackageTargets.current.get(nextPackage.manifest.packageId) ?? [])];
+    for (const targetDeviceId of remaining) {
+      const offer: PackageOfferMessage = {
+        type: "package:offer",
+        deliveryScope: "room",
+        packageId: nextPackage.manifest.packageId,
+        targetDeviceId,
+        senderDeviceId: currentIdentity.deviceId,
+        senderPublicKey: currentIdentity.publicKey,
+        manifest: nextPackage.manifest,
+        createdAt: Date.now()
+      };
+      roomSocketRef.current?.send(offer);
+    }
+  }
+
+  function sendRoomTextOffers(offer: TextOfferMessage, targetDeviceIds?: string[]) {
+    const pending = pendingText.current;
+    const remaining = targetDeviceIds ?? [...(pending?.expectedReceiverIds ?? [])];
+    for (const targetDeviceId of remaining) {
+      roomSocketRef.current?.send({ ...offer, targetDeviceId });
+    }
+  }
+
+  function markPackageAccepted(packageId: string, receiverDeviceId: string) {
+    const targets = pendingPackageTargets.current.get(packageId);
+    if (!targets) {
+      stopOfferResend();
+      return;
+    }
+    targets.delete(receiverDeviceId);
+    if (targets.size === 0) {
+      pendingPackageTargets.current.delete(packageId);
+      stopOfferResend();
     }
   }
 
@@ -638,6 +688,7 @@ export default function App() {
   async function beginSendingToReceiver(message: PackageAcceptMessage) {
     const currentIdentity = identityRef.current;
     if (!currentIdentity || !localPackage) return;
+    if (activeSenders.current.has(message.receiverDeviceId)) return;
     setConnectionRoute("checking");
     setSendState("sending");
     setView("sending");
@@ -667,10 +718,15 @@ export default function App() {
       },
       onComplete: () => {
         activeSenders.current.delete(message.receiverDeviceId);
-        if (activeSenders.current.size === 0) {
+        const waitingTargets = pendingPackageTargets.current.get(localPackage.manifest.packageId)?.size ?? 0;
+        if (activeSenders.current.size === 0 && waitingTargets === 0) {
           setSendState("sent");
           setStatus("已送达");
           setView("success");
+        } else if (activeSenders.current.size === 0) {
+          setSendState("waiting");
+          setStatus(`已送达一台设备，等待 ${waitingTargets} 台设备接收`);
+          setView("waiting");
         } else {
           setStatus("已送达一台设备，继续发送");
         }
@@ -793,11 +849,13 @@ export default function App() {
 
   async function createFreshRoom() {
     if (!identity) return;
+    if (!window.confirm("退出当前房间会断开已添加设备，需要重新邀请。确定要新建连接吗？")) return;
     try {
       stopOfferResend();
       closePairSession();
       activeSenders.current.forEach((sender) => sender.cancel());
       activeSenders.current.clear();
+      pendingPackageTargets.current.clear();
       activeReceiver.current?.close();
       activeReceiver.current = null;
       roomSocketRef.current?.close();
@@ -848,6 +906,7 @@ export default function App() {
     closePairSession();
     activeSenders.current.forEach((sender) => sender.cancel());
     activeSenders.current.clear();
+    pendingPackageTargets.current.clear();
     activeReceiver.current?.close();
     activeReceiver.current = null;
     setLocalPackage(null);
@@ -877,6 +936,7 @@ export default function App() {
     activeReceiver.current?.close();
     closePairSession();
     pendingText.current = null;
+    pendingPackageTargets.current.clear();
     setLocalPackage(null);
     setSendState("idle");
     setProgress(null);
@@ -1008,6 +1068,7 @@ export default function App() {
               localPackage={localPackage}
               clipboardText={clipboardText}
               isPreviewingText={isPreviewingText}
+              deviceCount={otherOnlineDevices.length}
               onSendSelf={sendToSelf}
               onShare={shareToOthers}
               onReset={reset}
@@ -1117,6 +1178,7 @@ function PreviewCard({
   localPackage,
   clipboardText,
   isPreviewingText,
+  deviceCount,
   onSendSelf,
   onShare,
   onReset
@@ -1124,6 +1186,7 @@ function PreviewCard({
   localPackage: LocalPackage | null;
   clipboardText: string;
   isPreviewingText: boolean;
+  deviceCount: number;
   onSendSelf: () => void;
   onShare: () => void;
   onReset: () => void;
@@ -1144,7 +1207,9 @@ function PreviewCard({
         )}
       </div>
       <div className="card-actions">
-        <button className="primary-action" onClick={onSendSelf}>发给我的设备</button>
+        <button className="primary-action" onClick={onSendSelf}>
+          {deviceCount > 0 ? `发给 ${deviceCount} 台设备` : "添加我的设备"}
+        </button>
         <button className="soft-action" onClick={onShare}>
           <Link />
           <span>分享给他人</span>
@@ -1189,7 +1254,7 @@ function SharingCard({
       <CardHeader label="分享文件" onClose={onClose} />
       <div className="share-body" style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
         <h2>文件已就绪</h2>
-        <p>对方扫描二维码，或输入下方密码接收</p>
+        <p>对方扫描二维码，或输入下方提取码接收</p>
         <div className="qr-container" style={{ margin: "16px 0 8px" }}>
           <canvas ref={canvasRef} />
         </div>
@@ -1198,7 +1263,7 @@ function SharingCard({
       <div className="split-actions">
         <button className="soft-action" onClick={onCopyCode}>
           {copiedCode ? <Check /> : <Copy />}
-          <span>{copiedCode ? "已复制" : "复制密码"}</span>
+          <span>{copiedCode ? "已复制" : "复制提取码"}</span>
         </button>
         <button className="primary-action" onClick={onCopyLink}>
           {copiedLink ? <Check /> : <Link />}
@@ -1284,6 +1349,7 @@ function ReceiveCodeCard({
               onChange={(e) => handleInputChange(e.target.value, index)}
               onKeyDown={(e) => handleKeyDown(e, index)}
               onPaste={handlePaste}
+              aria-label={`提取码第 ${index + 1} 位`}
               maxLength={1}
               autoFocus={index === 0}
               spellCheck={false}
@@ -1492,8 +1558,8 @@ function AddDeviceModal({
           ))}
         </div>
 
-        <button className="soft-action room-reset-action" onClick={onCreateRoom} style={{ marginTop: "4px" }}>
-          <span>退出房间 / 新建连接</span>
+        <button className="soft-action room-reset-action danger-action" onClick={onCreateRoom} style={{ marginTop: "4px" }}>
+          <span>退出当前房间并新建</span>
         </button>
 
       </motion.div>

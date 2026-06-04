@@ -9,6 +9,7 @@ import {
 } from "../shared/protocol";
 import { packChunk, unpackChunk } from "./peerFrame";
 import type { ReceiveSink } from "./receiveSink";
+import { Sha256Incremental } from "./sha256Incremental";
 
 type SendSignal = (message: RtcOfferMessage | RtcAnswerMessage | RtcIceMessage) => void;
 
@@ -330,6 +331,7 @@ export class PackageReceiver {
   private channel?: RTCDataChannel;
   private receivedChunks = new Map<string, number>();
   private finishedEntries = new Set<string>();
+  private fileHashes = new Map<string, Sha256Incremental>();
   private pendingIce: RtcIceMessage[] = [];
 
   constructor(
@@ -437,6 +439,7 @@ export class PackageReceiver {
     }
 
     await this.options.sink.writeChunk(entry, bytes);
+    this.ensureFileHash(entry.id).update(bytes);
     this.receivedChunks.set(entry.id, expectedIndex + 1);
     this.received += bytes.byteLength;
     this.options.onProgress({
@@ -461,6 +464,7 @@ export class PackageReceiver {
       if (!entry) throw new Error("收到未知文件");
       if (this.finishedEntries.has(entry.id)) return;
       this.currentEntry = entry;
+      this.ensureFileHash(entry.id);
       await this.options.sink.startFile(entry);
       return;
     }
@@ -469,6 +473,11 @@ export class PackageReceiver {
       const entry = this.entries.get(message.entryId);
       if (entry && this.currentEntry?.id === entry.id) {
         await this.options.sink.finishFile(entry);
+        const actualHash = this.ensureFileHash(entry.id).digestHex();
+        this.fileHashes.delete(entry.id);
+        if (actualHash !== entry.sha256.toLowerCase()) {
+          throw new Error(`文件校验失败：${entry.relativePath}`);
+        }
         this.finishedEntries.add(entry.id);
         this.currentEntry = undefined;
       }
@@ -485,6 +494,14 @@ export class PackageReceiver {
     const entries: Record<string, number> = {};
     for (const [entryId, count] of this.receivedChunks) entries[entryId] = count;
     return { entries };
+  }
+
+  private ensureFileHash(entryId: string): Sha256Incremental {
+    const existing = this.fileHashes.get(entryId);
+    if (existing) return existing;
+    const next = new Sha256Incremental();
+    this.fileHashes.set(entryId, next);
+    return next;
   }
 
   private sendControl(value: ControlMessage): void {
