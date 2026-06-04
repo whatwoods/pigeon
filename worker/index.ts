@@ -91,13 +91,7 @@ app.post("/api/pairs", async (c) => {
     .run();
 
   // Async cleanup of expired records
-  c.executionCtx.waitUntil(
-    Promise.all([
-      c.env.DB.prepare("DELETE FROM pair_rooms WHERE expires_at < ?").bind(Date.now()).run(),
-      c.env.DB.prepare("DELETE FROM room_invites WHERE expires_at < ?").bind(Date.now()).run(),
-      c.env.DB.prepare("DELETE FROM pair_attempts WHERE timestamp < ?").bind(Date.now() - 60000).run()
-    ]).catch(() => {})
-  );
+  c.executionCtx.waitUntil(cleanupExpiredRecords(c.env, Date.now()));
 
   const origin = c.env.APP_ORIGIN || new URL(c.req.url).origin;
   return c.json({
@@ -150,13 +144,8 @@ app.get("/ws/pair/:code", async (c) => {
   const now = Date.now();
 
   // Rate limiting lookup
-  const attempts = await c.env.DB.prepare(
-    "SELECT COUNT(*) as count FROM pair_attempts WHERE ip = ? AND timestamp > ?"
-  )
-    .bind(ip, now - 60000)
-    .first<{ count: number }>();
-
-  if (attempts && attempts.count >= 5) {
+  const attempts = await countRecentPairAttempts(c.env, ip, now - 60000);
+  if (attempts >= 5) {
     return c.text("Too many failed attempts. Please try again in a minute.", 429);
   }
 
@@ -167,30 +156,16 @@ app.get("/ws/pair/:code", async (c) => {
 
   if (!row || row.expires_at < now) {
     // Record failed attempt
-    await c.env.DB.prepare("INSERT INTO pair_attempts (ip, timestamp) VALUES (?, ?)")
-      .bind(ip, now)
-      .run();
+    await recordFailedPairAttempt(c.env, ip, now);
 
-    c.executionCtx.waitUntil(
-      Promise.all([
-        c.env.DB.prepare("DELETE FROM pair_rooms WHERE expires_at < ?").bind(now).run(),
-        c.env.DB.prepare("DELETE FROM room_invites WHERE expires_at < ?").bind(now).run(),
-        c.env.DB.prepare("DELETE FROM pair_attempts WHERE timestamp < ?").bind(now - 60000).run()
-      ]).catch(() => {})
-    );
+    c.executionCtx.waitUntil(cleanupExpiredRecords(c.env, now));
 
     return c.text("Pair code expired", 404);
   }
 
   if (role !== "sender" && role !== "receiver") return c.text("Missing role", 400);
 
-  c.executionCtx.waitUntil(
-    Promise.all([
-      c.env.DB.prepare("DELETE FROM pair_rooms WHERE expires_at < ?").bind(now).run(),
-      c.env.DB.prepare("DELETE FROM room_invites WHERE expires_at < ?").bind(now).run(),
-      c.env.DB.prepare("DELETE FROM pair_attempts WHERE timestamp < ?").bind(now - 60000).run()
-    ]).catch(() => {})
-  );
+  c.executionCtx.waitUntil(cleanupExpiredRecords(c.env, now));
 
   const id = c.env.PAIR_ROOM.idFromName(codeHash);
   const stub = c.env.PAIR_ROOM.get(id);
@@ -272,6 +247,48 @@ async function authenticateRoomDevice(
     : env.DB.prepare("SELECT id, name FROM room_devices WHERE room_id = ? AND token_hash = ?")
         .bind(roomId, await sha256Hex(roomToken));
   return query.first<{ id: string; name: string }>();
+}
+
+async function countRecentPairAttempts(env: Env, ip: string, since: number): Promise<number> {
+  try {
+    const attempts = await env.DB.prepare("SELECT COUNT(*) as count FROM pair_attempts WHERE ip = ? AND timestamp > ?")
+      .bind(ip, since)
+      .first<{ count: number }>();
+    return attempts?.count ?? 0;
+  } catch (error) {
+    if (isMissingPairAttemptsTable(error)) return 0;
+    throw error;
+  }
+}
+
+async function recordFailedPairAttempt(env: Env, ip: string, timestamp: number): Promise<void> {
+  try {
+    await env.DB.prepare("INSERT INTO pair_attempts (ip, timestamp) VALUES (?, ?)")
+      .bind(ip, timestamp)
+      .run();
+  } catch (error) {
+    if (!isMissingPairAttemptsTable(error)) throw error;
+  }
+}
+
+function cleanupExpiredRecords(env: Env, now: number): Promise<unknown> {
+  return Promise.all([
+    env.DB.prepare("DELETE FROM pair_rooms WHERE expires_at < ?").bind(now).run(),
+    env.DB.prepare("DELETE FROM room_invites WHERE expires_at < ?").bind(now).run(),
+    deleteExpiredPairAttempts(env, now - 60000)
+  ]).catch(() => {});
+}
+
+async function deleteExpiredPairAttempts(env: Env, cutoff: number): Promise<void> {
+  try {
+    await env.DB.prepare("DELETE FROM pair_attempts WHERE timestamp < ?").bind(cutoff).run();
+  } catch (error) {
+    if (!isMissingPairAttemptsTable(error)) throw error;
+  }
+}
+
+function isMissingPairAttemptsTable(error: unknown): boolean {
+  return error instanceof Error && /no such table:\s*pair_attempts/i.test(error.message);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

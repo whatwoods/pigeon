@@ -129,6 +129,7 @@ export default function App() {
   const identityRef = useRef<DeviceIdentity | null>(null);
   const roomSocketRef = useRef<SignalSocket | null>(null);
   const pendingPairSocket = useRef<SignalSocket | null>(null);
+  const handleSignalRef = useRef<(message: SignalMessage, source: SignalSource) => Promise<void> | void>(() => undefined);
   const activeSenders = useRef(new Map<string, PackageSender>());
   const activeReceiver = useRef<PackageReceiver | null>(null);
   const pendingText = useRef<PendingTextSend | null>(null);
@@ -263,7 +264,7 @@ export default function App() {
 
     roomSocketRef.current = openSignalSocket(path, {
       onOpen: () => setStatus("准备就绪"),
-      onMessage: (message) => handleSignal(message, "room"),
+      onMessage: (message) => handleSignalRef.current(message, "room"),
       onClose: () => setStatus("房间连接已断开"),
       onError: () => setStatus("房间连接失败")
     });
@@ -273,83 +274,84 @@ export default function App() {
     api.turn().then(setTurn).catch(() => setTurn(EMPTY_TURN));
   }
 
-  const handleSignal = useCallback(
-    async (message: SignalMessage, source: SignalSource) => {
-      const currentIdentity = identityRef.current;
-      if (!currentIdentity) return;
+  async function handleSignal(message: SignalMessage, source: SignalSource) {
+    const currentIdentity = identityRef.current;
+    if (!currentIdentity) return;
 
-      try {
-        if (message.type === "room:presence") {
-          setOnlineDevices(message.onlineDevices);
-          return;
-        }
-
-        if (message.type === "text:offer") {
-          acceptTextOffer(message, currentIdentity, source);
-          return;
-        }
-
-        if (message.type === "text:accept") {
-          stopOfferResend();
-          await sendPairedText(message);
-          return;
-        }
-
-        if (message.type === "text:payload") {
-          const key = await deriveAesKey(currentIdentity.privateKey, message.senderPublicKey);
-          const text = await decryptText(message.iv, message.ciphertext, key);
-          setIncomingText({ text, from: message.senderDeviceId });
-          setStatus("收到文本");
-          setView("success");
-          return;
-        }
-
-        if (message.type === "package:offer") {
-          packageSources.current.set(message.packageId, source);
-          setIncomingPackage({ offer: message, source });
-          setConnectionRoute(null);
-          setProgress(null);
-          setStatus("收到投递包");
-          return;
-        }
-
-        if (message.type === "package:accept") {
-          stopOfferResend();
-          await beginSendingToReceiver(message);
-          return;
-        }
-
-        if (message.type === "package:reject") {
-          setStatus("对方已拒绝");
-          return;
-        }
-
-        if (message.type === "rtc:answer") {
-          await handleRtcAnswer(message);
-          return;
-        }
-
-        if (message.type === "rtc:offer") {
-          await activeReceiver.current?.handleOffer(message);
-          return;
-        }
-
-        if (message.type === "rtc:ice") {
-          await handleRtcIce(message);
-          return;
-        }
-
-        if (message.type === "transfer:cancel") {
-          cancelTransfer("传输已取消");
-        }
-      } catch (error) {
-        setSendState("error");
-        setStatus(error instanceof Error ? error.message : "传输失败");
-        setView("error");
+    try {
+      if (message.type === "room:presence") {
+        setOnlineDevices(message.onlineDevices);
+        return;
       }
-    },
-    [localPackage, turn]
-  );
+
+      if (message.type === "text:offer") {
+        acceptTextOffer(message, currentIdentity, source);
+        return;
+      }
+
+      if (message.type === "text:accept") {
+        stopOfferResend();
+        await sendPairedText(message);
+        return;
+      }
+
+      if (message.type === "text:payload") {
+        const key = await deriveAesKey(currentIdentity.privateKey, message.senderPublicKey);
+        const text = await decryptText(message.iv, message.ciphertext, key);
+        setIncomingText({ text, from: message.senderDeviceId });
+        setStatus("收到文本");
+        setView("success");
+        return;
+      }
+
+      if (message.type === "package:offer") {
+        packageSources.current.set(message.packageId, source);
+        setIncomingPackage({ offer: message, source });
+        setConnectionRoute(null);
+        setProgress(null);
+        setStatus("收到投递包");
+        return;
+      }
+
+      if (message.type === "package:accept") {
+        stopOfferResend();
+        await beginSendingToReceiver(message);
+        return;
+      }
+
+      if (message.type === "package:reject") {
+        setStatus("对方已拒绝");
+        return;
+      }
+
+      if (message.type === "rtc:answer") {
+        await handleRtcAnswer(message);
+        return;
+      }
+
+      if (message.type === "rtc:offer") {
+        await activeReceiver.current?.handleOffer(message);
+        return;
+      }
+
+      if (message.type === "rtc:ice") {
+        await handleRtcIce(message);
+        return;
+      }
+
+      if (message.type === "transfer:cancel") {
+        cancelTransfer("传输已取消");
+      }
+    } catch (error) {
+      setSendState("error");
+      setStatus(error instanceof Error ? error.message : "传输失败");
+      setView("error");
+    }
+  }
+
+  useEffect(() => {
+    handleSignalRef.current = handleSignal;
+  });
 
   function connectPairReceiver(code: string, nextIdentity = identityRef.current) {
     if (!nextIdentity) return;
@@ -358,7 +360,7 @@ export default function App() {
       `/ws/pair/${encodeURIComponent(code)}?role=receiver&deviceId=${encodeURIComponent(nextIdentity.deviceId)}`,
       {
         onOpen: () => setStatus("等待配对内容"),
-        onMessage: (message) => handleSignal(message, "pair"),
+        onMessage: (message) => handleSignalRef.current(message, "pair"),
         onClose: () => setStatus("配对已结束"),
         onError: () => {
           setStatus("配对失败");
@@ -573,13 +575,13 @@ export default function App() {
         `/ws/pair/${encodeURIComponent(pair.code)}?role=sender&deviceId=${encodeURIComponent(identity.deviceId)}`,
         {
           onOpen: () => {
-            const offer = createPairOffer(pair.code);
+            const offer = createPairOffer(pair.code, socket);
             if (offer) {
               socket.send(offer);
               startOfferResend(() => socket.send(offer));
             }
           },
-          onMessage: (message) => handleSignal(message, "pair"),
+          onMessage: (message) => handleSignalRef.current(message, "pair"),
           onClose: () => setStatus("配对已结束"),
           onError: () => setStatus("配对失败")
         }
@@ -596,7 +598,7 @@ export default function App() {
     }
   }
 
-  function createPairOffer(code: string): PackageOfferMessage | TextOfferMessage | null {
+  function createPairOffer(code: string, socket?: SignalSocket): PackageOfferMessage | TextOfferMessage | null {
     const currentIdentity = identityRef.current;
     if (!currentIdentity) return null;
 
@@ -616,7 +618,7 @@ export default function App() {
     if (clipboardText) {
       const existing = pendingText.current;
       const id = existing?.id || crypto.randomUUID();
-      pendingText.current = { id, text: clipboardText, source: "pair", socket: pendingPairSocket.current ?? undefined };
+      pendingText.current = { id, text: clipboardText, source: "pair", socket: socket ?? pendingPairSocket.current ?? undefined };
       return {
         type: "text:offer",
         deliveryScope: "pair",
