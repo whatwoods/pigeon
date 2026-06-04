@@ -11,8 +11,12 @@ import {
   Lock,
   Plus,
   Smartphone,
+  Tablet,
+  Monitor,
+  AlertTriangle,
   X
 } from "lucide-react";
+import QRCode from "qrcode";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./lib/api";
 import { deriveAesKey, decryptText, encryptText } from "./lib/crypto";
@@ -78,11 +82,25 @@ const CONNECTION_ROUTE_LABELS: Record<ConnectionRoute, string> = {
 
 const IS_MOBILE = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
 
+function inferDeviceType(uaOrName: string): "mobile" | "tablet" | "desktop" {
+  const str = uaOrName.toLowerCase();
+  if (/(tablet|ipad|playbook|silk)|(android(?!.*mobi))/i.test(str)) return "tablet";
+  if (/mobile|ip(hone|od)|android|blackberry|iemobile|kindle|silk-accelerated|(hpw|web)os|opera m(obi|ini)/i.test(str)) return "mobile";
+  if (str.includes("phone")) return "mobile";
+  return "desktop";
+}
+
+function getDeviceIcon(type: "mobile" | "tablet" | "desktop") {
+  if (type === "mobile") return <Smartphone />;
+  if (type === "tablet") return <Tablet />;
+  return <Laptop />;
+}
+
 export default function App() {
   const [identity, setIdentity] = useState<DeviceIdentity | null>(null);
   const [roomSession, setRoomSession] = useState<StoredRoomSession | null>(null);
   const [onlineDevices, setOnlineDevices] = useState<RoomDevicePresence[]>([]);
-  const [status, setStatus] = useState("端到端加密");
+  const [status, setStatus] = useState("准备就绪");
   const [view, setView] = useState<ViewState>("idle");
   const [localPackage, setLocalPackage] = useState<LocalPackage | null>(null);
   const [clipboardText, setClipboardText] = useState("");
@@ -94,11 +112,18 @@ export default function App() {
   const [connectionRoute, setConnectionRoute] = useState<ConnectionRoute | null>(null);
   const [receiveCode, setReceiveCode] = useState("");
   const [showAddDevice, setShowAddDevice] = useState(false);
+  const [showDeviceHint, setShowDeviceHint] = useState(false);
   const [deviceInviteUrl, setDeviceInviteUrl] = useState("");
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
   const [dragActive, setDragActive] = useState(false);
+  const [shakeError, setShakeError] = useState(false);
   const [turn, setTurn] = useState<TurnResponse>(EMPTY_TURN);
+  const [toast, setToast] = useState<{ message: string; type: "success" | "warning" | "error" | "info" } | null>(null);
+
+  const showToast = useCallback((message: string, type: "success" | "warning" | "error" | "info" = "info") => {
+    setToast({ message, type });
+  }, []);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const identityRef = useRef<DeviceIdentity | null>(null);
@@ -198,7 +223,7 @@ export default function App() {
       `&deviceName=${encodeURIComponent(nextIdentity.deviceName)}`;
 
     roomSocketRef.current = openSignalSocket(path, {
-      onOpen: () => setStatus("端到端加密"),
+      onOpen: () => setStatus("准备就绪"),
       onMessage: (message) => handleSignal(message, "room"),
       onClose: () => setStatus("房间连接已断开"),
       onError: () => setStatus("房间连接失败")
@@ -296,7 +321,15 @@ export default function App() {
         onOpen: () => setStatus("等待配对内容"),
         onMessage: (message) => handleSignal(message, "pair"),
         onClose: () => setStatus("配对已结束"),
-        onError: () => setStatus("配对失败")
+        onError: () => {
+          setStatus("配对失败");
+          setShakeError(true);
+          showToast("提取码无效或已过期", "error");
+          setTimeout(() => {
+            setShakeError(false);
+            setReceiveCode("");
+          }, 600);
+        }
       }
     );
   }
@@ -389,12 +422,10 @@ export default function App() {
       const text = await navigator.clipboard.readText();
       if (!text.trim()) {
         if (items) {
-          setStatus("剪贴板为空");
+          showToast("剪贴板为空", "warning");
         } else {
-          // 如果 items 为 undefined，说明前面 read() 不支持或抛错了。
-          // 此时剪切板里可能有图片，只是没读出来，所以引导用户使用全局快捷键
           document.body.focus();
-          setStatus(IS_MOBILE ? "无法读取剪切板文件，请手动选择文件" : "无法读取文件，请尝试快捷键 Ctrl+V / Cmd+V 粘贴");
+          showToast(IS_MOBILE ? "无法读取剪切板文件，请手动选择文件" : "无法读取文件，请尝试快捷键 Ctrl+V / Cmd+V 粘贴", "warning");
         }
         return;
       }
@@ -404,9 +435,8 @@ export default function App() {
       setStatus("文本已就绪");
       setView("file_preview");
     } catch {
-      // Clipboard API 不可用或被拒绝，聚焦页面以便用户直接 Ctrl+V
       document.body.focus();
-      setStatus(IS_MOBILE ? "无法读取剪切板，请检查权限或选择文件" : "请使用快捷键 Ctrl+V / Cmd+V 粘贴");
+      showToast(IS_MOBILE ? "无法读取剪切板，请检查权限或选择文件" : "请使用快捷键 Ctrl+V / Cmd+V 粘贴", "warning");
     }
   }
 
@@ -454,6 +484,7 @@ export default function App() {
     if (!identity) return;
     if (otherOnlineDevices.length === 0) {
       setStatus("没有其他在线设备");
+      setShowDeviceHint(true);
       return;
     }
 
@@ -679,8 +710,8 @@ export default function App() {
     sendPackageSignal(offer.packageId, message);
     setIncomingPackage(null);
     setConnectionRoute(null);
-    setStatus("已拒绝");
     setView("idle");
+    showToast("已拒绝", "warning");
   }
 
   function sendPackageSignal(packageId: string, message: PackageAcceptMessage | PackageRejectMessage | RtcOfferMessage | RtcAnswerMessage | RtcIceMessage) {
@@ -737,7 +768,7 @@ export default function App() {
   async function copyReceivedText() {
     if (!incomingText) return;
     await navigator.clipboard.writeText(incomingText.text);
-    setStatus("已复制");
+    showToast("已复制文本", "success");
   }
 
   function reset() {
@@ -755,7 +786,7 @@ export default function App() {
     setProgress(null);
     setConnectionRoute(null);
     setReceiveCode("");
-    setStatus("端到端加密");
+    setStatus("准备就绪");
     setView("idle");
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
@@ -784,7 +815,7 @@ export default function App() {
 
   function startOfferResend(sendOffer: () => void) {
     stopOfferResend();
-    offerTimer.current = window.setInterval(sendOffer, 2000);
+    offerTimer.current = window.setInterval(sendOffer, 2000) as any;
   }
 
   function stopOfferResend() {
@@ -823,6 +854,20 @@ export default function App() {
       <NoiseOverlay />
       <OrganicBackground />
       <AnimatePresence>
+        {toast && (
+          <motion.div
+            className={`toast-alert ${toast.type}`}
+            initial={{ opacity: 0, y: -20, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.9 }}
+            onAnimationComplete={() => {
+              setTimeout(() => setToast(null), 2500);
+            }}
+          >
+            {toast.type === "success" ? <Check /> : toast.type === "info" ? <Feather /> : <AlertTriangle />}
+            <span>{toast.message}</span>
+          </motion.div>
+        )}
         {showAddDevice ? (
           <AddDeviceModal
             inviteUrl={deviceInviteUrl}
@@ -846,17 +891,33 @@ export default function App() {
           <span>Pigeon</span>
         </button>
         <div className="topbar-actions">
-          <button className="device-pill" onClick={createDeviceInvite}>
-            {otherOnlineDevices.length > 0 ? <span className="online-dot" /> : <Plus />}
-            <span>{otherOnlineDevices.length > 0 ? `${onlineDevices.length} 台设备在线` : "添加设备"}</span>
-          </button>
+          <div className="device-pill-wrapper">
+            <button className="device-pill" onClick={createDeviceInvite}>
+              {otherOnlineDevices.length > 0 ? <span className="online-dot" /> : <Plus />}
+              <span>{otherOnlineDevices.length > 0 ? `${onlineDevices.length} 台设备在线` : "添加设备"}</span>
+            </button>
+            <AnimatePresence>
+              {showDeviceHint && (
+                <motion.div
+                  className="device-hint-popover"
+                  initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                  onAnimationComplete={() => setTimeout(() => setShowDeviceHint(false), 3000)}
+                >
+                  <div className="popover-arrow" />
+                  请先在这里添加设备
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
           <InstallButton />
         </div>
       </motion.header>
 
       <main className="workspace" aria-live="polite">
         <AnimatePresence mode="wait">
-          {incomingPackage ? (
+          {incomingPackage && view !== "sending" && view !== "success" ? (
             <IncomingPackageCard
               key="incoming"
               incomingPackage={incomingPackage}
@@ -892,9 +953,10 @@ export default function App() {
               onChange={setReceiveCode}
               onSubmit={submitReceiveCode}
               onClose={reset}
+              hasError={shakeError}
             />
           ) : view === "waiting" ? (
-            <WaitingCard key="waiting" status={status} onCancel={() => cancelTransfer()} />
+            <WaitingCard key="waiting" status={status} onCancel={() => cancelTransfer()} localType={inferDeviceType(navigator.userAgent)} />
           ) : view === "sending" ? (
             <SendingCard
               key="sending"
@@ -902,6 +964,12 @@ export default function App() {
               route={connectionRoute}
               status={status}
               onCancel={() => cancelTransfer()}
+              localType={inferDeviceType(navigator.userAgent)}
+              remoteType={
+                activeReceiver.current
+                  ? inferDeviceType(onlineDevices.find((d) => d.deviceId === incomingPackage?.offer.senderDeviceId)?.deviceName || "mobile")
+                  : inferDeviceType(onlineDevices.find((d) => activeSenders.current.has(d.deviceId))?.deviceName || "mobile")
+              }
             />
           ) : view === "success" ? (
             <SuccessCard key="success" status={status} onDone={reset} />
@@ -942,12 +1010,9 @@ function IdleCard({
   onPaste: () => void;
   onReceive: () => void;
 }) {
-  const isHint = status.includes("Ctrl+V") || status.includes("为空") || status.includes("断开") || status.includes("权限") || status.includes("手动");
-
   return (
     <GlassCard className="idle-card">
       <div className="card-intro">
-        <h1>{isHint ? "端到端加密" : (status || "准备就绪")}</h1>
         <p>{IS_MOBILE ? "选择文件，即可分享" : "选择或拖入文件，即可分享"}</p>
       </div>
       <input ref={fileInputRef} type="file" multiple hidden onChange={(event) => onFiles(event.currentTarget.files)} />
@@ -958,15 +1023,6 @@ function IdleCard({
           <span>选择文件</span>
         </motion.button>
       </div>
-      {isHint && (
-        <motion.div
-          initial={{ opacity: 0, y: -4 }}
-          animate={{ opacity: 1, y: 0 }}
-          style={{ color: "#ff6b6b", fontSize: "0.85rem", marginBottom: "0.75rem", fontWeight: 500, textAlign: "center" }}
-        >
-          {status}
-        </motion.div>
-      )}
       <div className="card-actions">
         <button className="primary-action" onClick={onPaste}>
           <ClipboardPaste />
@@ -1037,13 +1093,31 @@ function SharingCard({
   onCopyLink: () => void;
   onClose: () => void;
 }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    if (pairSession.url && canvasRef.current) {
+      QRCode.toCanvas(canvasRef.current, pairSession.url, {
+        width: 140,
+        margin: 1,
+        color: {
+          dark: "#4a4947",
+          light: "#ffffff00"
+        }
+      });
+    }
+  }, [pairSession.url]);
+
   return (
     <GlassCard className="share-card">
       <CardHeader label="分享文件" onClose={onClose} />
-      <div className="share-body">
+      <div className="share-body" style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
         <h2>文件已就绪</h2>
-        <p>对方输入提取码或访问链接即可接收</p>
-        <strong>{pairSession.code}</strong>
+        <p>对方扫描二维码，或输入下方密码接收</p>
+        <div className="qr-container" style={{ margin: "16px 0 8px" }}>
+          <canvas ref={canvasRef} />
+        </div>
+        <strong style={{ fontSize: "2.2rem", letterSpacing: "6px", margin: "8px 0" }}>{pairSession.code}</strong>
       </div>
       <div className="split-actions">
         <button className="soft-action" onClick={onCopyCode}>
@@ -1063,27 +1137,86 @@ function ReceiveCodeCard({
   value,
   onChange,
   onSubmit,
-  onClose
+  onClose,
+  hasError
 }: {
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
   onClose: () => void;
+  hasError: boolean;
 }) {
+  const codeArray = Array.from({ length: 6 }, (_, i) => value[i] || "");
+  const inputsRef = useRef<(HTMLInputElement | null)[]>([]);
+
+  useEffect(() => {
+    if (value === "") {
+      inputsRef.current[0]?.focus();
+    }
+  }, [value]);
+
+  const handleInputChange = (char: string, index: number) => {
+    const newCode = value.split("");
+    newCode[index] = char.slice(-1).toUpperCase();
+    const result = newCode.join("").slice(0, 6);
+    onChange(result);
+
+    if (char && index < 5) {
+      inputsRef.current[index + 1]?.focus();
+    }
+    
+    if (result.length === 6) {
+      // Allow state to update before submitting
+      setTimeout(onSubmit, 50);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>, index: number) => {
+    if (e.key === "Backspace" && !codeArray[index] && index > 0) {
+      inputsRef.current[index - 1]?.focus();
+      const newCode = value.split("");
+      newCode[index - 1] = "";
+      onChange(newCode.join(""));
+    }
+  };
+
+  const handlePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+    e.preventDefault();
+    const pastedData = e.clipboardData.getData("text").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+    if (pastedData) {
+      onChange(pastedData.slice(0, 6));
+      const nextFocusIndex = Math.min(pastedData.length, 5);
+      inputsRef.current[nextFocusIndex]?.focus();
+      if (pastedData.length >= 6) {
+        setTimeout(onSubmit, 50);
+      }
+    }
+  };
+
   return (
     <GlassCard className="receive-card">
       <CardHeader label="接收文件" onClose={onClose} />
-      <div className="receive-body">
-        <div className="file-icon receive-symbol"><Download /></div>
-        <input
-          value={value}
-          onChange={(event) => onChange(event.target.value.toUpperCase())}
-          placeholder="输入6位提取码"
-          maxLength={12}
-          autoFocus
-        />
+      <div className={`receive-body ${hasError ? "shake-animation" : ""}`}>
+        <p className="receive-hint">请输入发送方提供的 6 位提取码</p>
+        <div className="segmented-code-input">
+          {codeArray.map((char, index) => (
+            <input
+              key={index}
+              ref={(el) => { inputsRef.current[index] = el; }}
+              className={char ? "has-value" : ""}
+              value={char}
+              onChange={(e) => handleInputChange(e.target.value, index)}
+              onKeyDown={(e) => handleKeyDown(e, index)}
+              onPaste={handlePaste}
+              maxLength={1}
+              autoFocus={index === 0}
+              spellCheck={false}
+              autoComplete="off"
+              autoCorrect="off"
+            />
+          ))}
+        </div>
       </div>
-      <button className="primary-action" disabled={value.trim().length < 6} onClick={onSubmit}>开始接收</button>
     </GlassCard>
   );
 }
@@ -1102,7 +1235,6 @@ function IncomingPackageCard({
     <GlassCard className="preview-card">
       <div className="panel-title">
         <span>接收请求</span>
-        <div className="security-chip"><Lock /><span>端到端加密</span></div>
       </div>
       <div className="preview-body">
         <FileVisual name={manifest.name} isFolder={manifest.entries.length > 1} />
@@ -1131,13 +1263,13 @@ function ReceivedTextCard({ text, onCopy, onClose }: { text: string; onCopy: () 
   );
 }
 
-function WaitingCard({ status, onCancel }: { status: string; onCancel: () => void }) {
+function WaitingCard({ status, onCancel, localType }: { status: string; onCancel: () => void; localType: "desktop" | "mobile" | "tablet" }) {
   return (
     <GlassCard className="sending-card">
       <div className="flight-icons">
-        <Laptop />
+        {getDeviceIcon(localType)}
         <span />
-        <Smartphone />
+        {getDeviceIcon(localType === "desktop" ? "mobile" : "desktop")}
       </div>
       <p>{status}</p>
       <button className="plain-cancel" onClick={onCancel}>取消</button>
@@ -1149,12 +1281,16 @@ function SendingCard({
   percent,
   route,
   status,
-  onCancel
+  onCancel,
+  localType,
+  remoteType
 }: {
   percent: number;
   route: ConnectionRoute | null;
   status: string;
   onCancel: () => void;
+  localType: "desktop" | "mobile" | "tablet";
+  remoteType: "desktop" | "mobile" | "tablet";
 }) {
   return (
     <GlassCard className="sending-card">
@@ -1168,9 +1304,9 @@ function SendingCard({
         </motion.div>
       </div>
       <div className="flight-icons">
-        <Laptop />
+        {getDeviceIcon(localType)}
         <span />
-        <Smartphone />
+        {getDeviceIcon(remoteType)}
       </div>
       <p>{route ? CONNECTION_ROUTE_LABELS[route] : status}</p>
       <small>{percent}%</small>
@@ -1216,15 +1352,31 @@ function AddDeviceModal({
   onCopy: () => void;
   onClose: () => void;
 }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    if (inviteUrl && canvasRef.current) {
+      QRCode.toCanvas(canvasRef.current, inviteUrl, {
+        width: 160,
+        margin: 1,
+        color: {
+          dark: "#4a4947",
+          light: "#ffffff00"
+        }
+      });
+    }
+  }, [inviteUrl]);
+
   return (
     <div className="modal-layer">
       <motion.div className="modal-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} />
       <motion.div className="add-device-modal" initial={{ opacity: 0, y: 20, scale: 0.95 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 20, scale: 0.95 }}>
         <button className="modal-close icon-button" onClick={onClose} aria-label="关闭"><X /></button>
-        <div className="modal-icon"><Laptop /></div>
         <h2>连接新设备</h2>
-        <p>在需要连接的设备浏览器中打开下方链接，即可加入您的房间。</p>
-        <div className="invite-url" title={inviteUrl}>{inviteUrl || "正在生成链接..."}</div>
+        <p>使用手机扫码，或复制链接在其他设备打开</p>
+        <div className="qr-container">
+          <canvas ref={canvasRef} />
+        </div>
         <button className="primary-action" onClick={onCopy} disabled={!inviteUrl}>
           {copied ? <Check /> : <Copy />}
           <span>{copied ? "已复制链接" : "复制房间链接"}</span>
@@ -1239,7 +1391,6 @@ function CardHeader({ label, onClose }: { label: string; onClose: () => void }) 
     <div className="panel-title">
       <div>
         <span>{label}</span>
-        <div className="security-chip"><Lock /><span>端到端加密</span></div>
       </div>
       <button className="icon-button" onClick={onClose} aria-label="关闭"><X /></button>
     </div>

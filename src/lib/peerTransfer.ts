@@ -263,7 +263,7 @@ export class PackageSender {
     this.retryTimer = window.setTimeout(() => {
       this.retryTimer = undefined;
       this.startAttempt().catch(this.options.onError);
-    }, delay);
+    }, delay) as any;
   }
 
   private closePeer(): void {
