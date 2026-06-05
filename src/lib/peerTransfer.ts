@@ -36,6 +36,7 @@ export type ConnectionRoute = "checking" | "lan" | "direct" | "relay";
 const MAX_RETRY_ATTEMPTS = 5;
 const RETRY_DELAYS_MS = [900, 1600, 2800, 4600, 7000];
 const RESUME_TIMEOUT_MS = 2000;
+const CONNECTION_TIMEOUT_MS = 30000;
 
 export class PackageSender {
   private pc?: RTCPeerConnection;
@@ -44,7 +45,8 @@ export class PackageSender {
   private completed = false;
   private connectionRoute?: ConnectionRoute;
   private attempt = 0;
-  private retryTimer?: ReturnType<typeof window.setTimeout>;
+  private retryTimer?: number;
+  private connectionTimer?: number;
   private sendingRun = 0;
   private pendingResume?: (state: ResumeState) => void;
   private pendingIce: RtcIceMessage[] = [];
@@ -61,7 +63,7 @@ export class PackageSender {
       signal: SendSignal;
       onProgress: (event: ProgressEvent) => void;
       onConnectionRoute?: (route: ConnectionRoute) => void;
-      onRetry?: (attempt: number, delayMs: number) => void;
+      onRetry?: (attempt: number, delayMs: number, reason?: string) => void;
       onComplete: () => void;
       onError: (error: Error) => void;
     }
@@ -113,11 +115,12 @@ export class PackageSender {
     channel.bufferedAmountLowThreshold = DATA_CHANNEL_BUFFER_LIMIT / 2;
     channel.onmessage = (event) => this.handleControlMessage(event.data);
     channel.onopen = () => {
+      this.clearConnectionTimer();
       this.updateConnectionRoute().catch(this.options.onError);
       this.sendPackage(run).catch((error) => this.handleSendError(error));
     };
-    channel.onclose = () => this.scheduleRetry();
-    channel.onerror = () => this.scheduleRetry();
+    channel.onclose = () => this.scheduleRetry("传输通道已关闭");
+    channel.onerror = () => this.scheduleRetry("传输通道出错");
 
     pc.onicecandidate = (event) => {
       if (!event.candidate) return;
@@ -129,19 +132,27 @@ export class PackageSender {
         candidate: event.candidate.toJSON()
       });
     };
+    pc.onicecandidateerror = (event) => {
+      console.warn("[pigeon] ICE candidate error", {
+        errorCode: event.errorCode,
+        errorText: event.errorText,
+        url: event.url
+      });
+    };
     pc.oniceconnectionstatechange = () => {
       this.updateConnectionRoute().catch(this.options.onError);
       if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
-        this.scheduleRetry();
+        this.scheduleRetry(`ICE 连接${pc.iceConnectionState === "failed" ? "失败" : "已断开"}`);
       }
     };
     pc.onconnectionstatechange = () => {
       this.updateConnectionRoute().catch(this.options.onError);
       if (pc.connectionState === "failed" || pc.connectionState === "disconnected" || pc.connectionState === "closed") {
-        this.scheduleRetry();
+        this.scheduleRetry(`WebRTC 连接${pc.connectionState === "failed" ? "失败" : pc.connectionState === "disconnected" ? "已断开" : "已关闭"}`);
       }
     };
     this.emitConnectionRoute("checking");
+    this.startConnectionTimer(pc, channel, run);
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -233,16 +244,48 @@ export class PackageSender {
     const channel = this.channel;
     if (!channel || channel.bufferedAmount < DATA_CHANNEL_BUFFER_LIMIT) return;
     await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(resolve, 500);
-      channel.onbufferedamountlow = () => {
+      const cleanup = () => {
         window.clearTimeout(timeout);
+        channel.removeEventListener("bufferedamountlow", handleLow);
+        channel.removeEventListener("error", handleError);
+      };
+      const handleLow = () => {
+        cleanup();
         resolve();
       };
-      channel.onerror = () => {
-        window.clearTimeout(timeout);
+      const handleError = () => {
+        cleanup();
         reject(new Error("传输通道失败"));
       };
+      const timeout = window.setTimeout(() => {
+        cleanup();
+        resolve();
+      }, 500);
+      channel.addEventListener("bufferedamountlow", handleLow, { once: true });
+      channel.addEventListener("error", handleError, { once: true });
     });
+  }
+
+  private startConnectionTimer(pc: RTCPeerConnection, channel: RTCDataChannel, run: number): void {
+    this.clearConnectionTimer();
+    this.connectionTimer = window.setTimeout(() => {
+      if (this.cancelled || this.completed || run !== this.sendingRun || this.pc !== pc) return;
+      if (channel.readyState === "open") return;
+      console.warn("[pigeon] WebRTC connection timeout", {
+        connectionState: pc.connectionState,
+        iceConnectionState: pc.iceConnectionState,
+        iceGatheringState: pc.iceGatheringState,
+        signalingState: pc.signalingState
+      });
+      this.scheduleRetry("连接超时，Data Channel 未打开");
+    }, CONNECTION_TIMEOUT_MS);
+  }
+
+  private clearConnectionTimer(): void {
+    if (this.connectionTimer) {
+      window.clearTimeout(this.connectionTimer);
+      this.connectionTimer = undefined;
+    }
   }
 
   private assertChannelOpen(): void {
@@ -257,28 +300,30 @@ export class PackageSender {
       this.options.onError(error);
       return;
     }
-    this.scheduleRetry();
+    this.scheduleRetry(error instanceof Error ? error.message : "传输失败");
   }
 
-  private scheduleRetry(): void {
+  private scheduleRetry(reason?: string): void {
     if (this.cancelled || this.completed || this.retryTimer || this.closingPeer) return;
+    this.clearConnectionTimer();
     const retryAttempt = this.attempt;
     if (retryAttempt > MAX_RETRY_ATTEMPTS) {
-      this.options.onError(new Error("传输连接多次中断，已停止自动重试"));
+      this.options.onError(new Error(describeConnectionFailure(this.options.iceServers, reason)));
       return;
     }
 
     const delay = RETRY_DELAYS_MS[Math.min(retryAttempt - 1, RETRY_DELAYS_MS.length - 1)];
-    this.options.onRetry?.(retryAttempt, delay);
+    this.options.onRetry?.(retryAttempt, delay, reason);
     this.retryTimer = window.setTimeout(() => {
       this.retryTimer = undefined;
       this.startAttempt().catch(this.options.onError);
-    }, delay) as any;
+    }, delay);
   }
 
   private closePeer(): void {
     this.pendingResume = undefined;
     this.pendingIce = [];
+    this.clearConnectionTimer();
     this.closingPeer = true;
     this.channel?.close();
     this.pc?.close();
@@ -317,7 +362,7 @@ export class PackageSender {
   }
 
   private async addIceCandidate(pc: RTCPeerConnection, message: RtcIceMessage): Promise<void> {
-    await pc.addIceCandidate(message.candidate as RTCIceCandidateInit).catch(() => undefined);
+    await addIceCandidateWithDiagnostics(pc, message);
   }
 }
 
@@ -401,6 +446,7 @@ export class PackageReceiver {
       channel.onmessage = (message) => {
         this.handleData(message.data).catch(this.options.onError);
       };
+      channel.onerror = () => this.options.onError(new Error("接收通道出错，请重试传输"));
     };
     pc.onicecandidate = (event) => {
       if (!event.candidate) return;
@@ -410,6 +456,13 @@ export class PackageReceiver {
         targetDeviceId: this.options.senderDeviceId,
         senderDeviceId: this.options.receiverDeviceId,
         candidate: event.candidate.toJSON()
+      });
+    };
+    pc.onicecandidateerror = (event) => {
+      console.warn("[pigeon] ICE candidate error", {
+        errorCode: event.errorCode,
+        errorText: event.errorText,
+        url: event.url
       });
     };
     pc.oniceconnectionstatechange = () => {
@@ -537,7 +590,18 @@ export class PackageReceiver {
   }
 
   private async addIceCandidate(pc: RTCPeerConnection, message: RtcIceMessage): Promise<void> {
-    await pc.addIceCandidate(message.candidate as RTCIceCandidateInit).catch(() => undefined);
+    await addIceCandidateWithDiagnostics(pc, message);
+  }
+}
+
+async function addIceCandidateWithDiagnostics(pc: RTCPeerConnection, message: RtcIceMessage): Promise<void> {
+  try {
+    await pc.addIceCandidate(message.candidate as RTCIceCandidateInit);
+  } catch (error) {
+    console.warn("[pigeon] addIceCandidate failed", {
+      message: error instanceof Error ? error.message : String(error),
+      candidate: message.candidate
+    });
   }
 }
 
@@ -593,6 +657,23 @@ function isCandidatePairStats(value: RTCStats): value is CandidatePairStats {
 function getCandidateType(value: RTCStats | undefined): string | undefined {
   const candidate = value as { candidateType?: string } | undefined;
   return candidate?.candidateType;
+}
+
+function describeConnectionFailure(iceServers: RTCIceServer[], reason?: string): string {
+  const detail = reason ? `${reason}。` : "";
+  if (!hasRelayIceServer(iceServers)) {
+    return `${detail}无法建立文件传输连接：当前没有 TURN 中继，跨网络或移动网络下可能停在 0%。请配置 TURN 后重试。`;
+  }
+  return `${detail}无法建立文件传输连接，请检查两端网络或 TURN 凭证是否可用。`;
+}
+
+function hasRelayIceServer(iceServers: RTCIceServer[]): boolean {
+  return iceServers.some((server) => toUrlList(server.urls).some((url) => /^turns?:/i.test(url)));
+}
+
+function toUrlList(value: string | string[] | undefined): string[] {
+  if (!value) return [];
+  return Array.isArray(value) ? value : [value];
 }
 
 interface CandidatePairStats extends RTCStats {

@@ -25,6 +25,8 @@ export interface IceServerPayload {
   credential?: string;
 }
 
+export type TurnCredentialSource = "cloudflare" | "static" | "stun-only";
+
 export interface PackageEntry {
   id: string;
   name: string;
@@ -375,4 +377,7 @@ export interface PairCreateResponse {
 
 export interface TurnResponse {
   iceServers: IceServerPayload[];
+  relayAvailable: boolean;
+  source: TurnCredentialSource;
+  warning?: string;
 }

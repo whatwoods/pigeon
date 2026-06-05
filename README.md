@@ -6,13 +6,13 @@
 
 ## 界面预览
 
-| 房间模式 (Room Mode) | 配对模式 (Pair Mode) |
-| :---: | :---: |
-| ![房间模式](docs/screenshots/room_mode.svg) | ![配对模式](docs/screenshots/pair_mode.svg) |
+| 主页 (Home) | 房间界面 (Room) | 传输界面 (Transfer) |
+| :---: | :---: | :---: |
+| ![主页](docs/screenshots/home_mode.png) | ![房间界面](docs/screenshots/room_mode.png) | ![传输界面](docs/screenshots/transfer_mode.png) |
 
 ### 动态演示
 
-![文件传输演示](docs/screenshots/file_transfer.svg)
+<video src="docs/screenshots/file_transfer.mp4" controls muted loop playsinline width="100%"></video>
 
 
 ## 特性
@@ -103,6 +103,33 @@ npm run deploy
 ```
 
 部署需要先通过 `wrangler login` 登录 Cloudflare 账号。
+
+### TURN 中继配置
+
+文件传输使用 WebRTC DataChannel。仅配置 STUN 时，同局域网或部分家庭网络可以直连，但手机网络、公司网络、对称 NAT / CGNAT 下通常需要 TURN 中继，否则进度可能停在 0%。
+
+推荐使用 Cloudflare Realtime TURN。先在 Cloudflare Dashboard 创建 TURN key，然后给 Worker 配置短期凭证生成所需变量：
+
+```bash
+npx wrangler secret put TURN_KEY_ID
+npx wrangler secret put TURN_KEY_API_TOKEN
+```
+
+可选配置：
+
+```bash
+npx wrangler secret put TURN_TTL_SECONDS
+```
+
+`TURN_TTL_SECONDS` 默认 86400 秒，最大会被限制为 172800 秒。浏览器不会拿到长期 TURN key，`/api/turn` 会由 Worker 动态生成短期 `iceServers`。
+
+也可以使用其他 TURN 服务作为静态兜底：
+
+```bash
+npx wrangler secret put TURN_URLS
+npx wrangler secret put TURN_USERNAME
+npx wrangler secret put TURN_CREDENTIAL
+```
 
 ## 可用脚本
 

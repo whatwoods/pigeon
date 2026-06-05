@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { DeviceRegistrationPayload, IceServerPayload } from "../src/shared/protocol";
+import type { DeviceRegistrationPayload, IceServerPayload, TurnResponse } from "../src/shared/protocol";
 import { randomId, randomToken, sha256Hex } from "./crypto";
 import { DeviceRoom, PairRoom } from "./durable";
 import type { Env } from "./types";
@@ -119,16 +119,8 @@ app.get("/ws/room/:roomId", async (c) => {
   return stub.fetch(c.req.raw);
 });
 
-app.get("/api/turn", (c) => {
-  const iceServers: IceServerPayload[] = [{ urls: "stun:stun.l.google.com:19302" }];
-  if (c.env.TURN_URLS && c.env.TURN_USERNAME && c.env.TURN_CREDENTIAL) {
-    iceServers.push({
-      urls: c.env.TURN_URLS.split(",").map((value) => value.trim()),
-      username: c.env.TURN_USERNAME,
-      credential: c.env.TURN_CREDENTIAL
-    });
-  }
-  return c.json({ iceServers });
+app.get("/api/turn", async (c) => {
+  return c.json(await resolveIceServers(c.env));
 });
 
 app.get("/ws/pair/:code", async (c) => {
@@ -181,6 +173,157 @@ function createPairCode(): string {
   const chars = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
   const bytes = crypto.getRandomValues(new Uint8Array(6));
   return Array.from(bytes).map((b) => chars[b % chars.length]).join("");
+}
+
+const DEFAULT_STUN_ICE_SERVERS: IceServerPayload[] = [{ urls: "stun:stun.l.google.com:19302" }];
+const CLOUDFLARE_TURN_CREDENTIAL_URL = "https://rtc.live.cloudflare.com/v1/turn/keys";
+const DEFAULT_TURN_TTL_SECONDS = 24 * 60 * 60;
+const MAX_TURN_TTL_SECONDS = 48 * 60 * 60;
+
+async function resolveIceServers(env: Env): Promise<TurnResponse> {
+  const staticTurn = readStaticTurnIceServers(env);
+
+  if (env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN) {
+    const cloudflareIceServers = await fetchCloudflareTurnIceServers(env);
+    if (cloudflareIceServers.length > 0) {
+      const relayAvailable = hasRelayIceServer(cloudflareIceServers);
+      return {
+        iceServers: cloudflareIceServers,
+        relayAvailable,
+        source: "cloudflare",
+        warning: relayAvailable ? undefined : "Cloudflare TURN 响应未包含中继地址，跨网络传输可能失败"
+      };
+    }
+
+    if (staticTurn.length > 0) {
+      const iceServers = [...DEFAULT_STUN_ICE_SERVERS, ...staticTurn];
+      return {
+        iceServers,
+        relayAvailable: hasRelayIceServer(iceServers),
+        source: "static",
+        warning: "Cloudflare TURN 凭证获取失败，已使用静态 TURN 配置"
+      };
+    }
+
+    return {
+      iceServers: DEFAULT_STUN_ICE_SERVERS,
+      relayAvailable: false,
+      source: "stun-only",
+      warning: "Cloudflare TURN 凭证获取失败，当前仅使用 STUN"
+    };
+  }
+
+  if (staticTurn.length > 0) {
+    const iceServers = [...DEFAULT_STUN_ICE_SERVERS, ...staticTurn];
+    const relayAvailable = hasRelayIceServer(iceServers);
+    return {
+      iceServers,
+      relayAvailable,
+      source: "static",
+      warning: relayAvailable ? undefined : "静态 TURN 配置未包含中继地址，跨网络传输可能失败"
+    };
+  }
+
+  if (env.TURN_URLS || env.TURN_USERNAME || env.TURN_CREDENTIAL) {
+    console.warn(JSON.stringify({ event: "turn_static_config_incomplete" }));
+  }
+
+  return {
+    iceServers: DEFAULT_STUN_ICE_SERVERS,
+    relayAvailable: false,
+    source: "stun-only",
+    warning: "未配置 TURN 中继，跨网络文件传输可能无法建立连接"
+  };
+}
+
+async function fetchCloudflareTurnIceServers(env: Env): Promise<IceServerPayload[]> {
+  const keyId = env.TURN_KEY_ID;
+  const apiToken = env.TURN_KEY_API_TOKEN;
+  if (!keyId || !apiToken) return [];
+
+  const response = await fetch(
+    `${CLOUDFLARE_TURN_CREDENTIAL_URL}/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ ttl: normalizeTurnTtl(env.TURN_TTL_SECONDS) })
+    }
+  ).catch((error) => {
+    logTurnIssue("cloudflare_turn_fetch_failed", error);
+    return null;
+  });
+
+  if (!response) return [];
+  if (!response.ok) {
+    logTurnIssue("cloudflare_turn_response_failed", { status: response.status });
+    return [];
+  }
+
+  const body = await response.json().catch((error) => {
+    logTurnIssue("cloudflare_turn_json_failed", error);
+    return null;
+  });
+  if (!isRecord(body) || !Array.isArray(body.iceServers)) {
+    logTurnIssue("cloudflare_turn_payload_invalid");
+    return [];
+  }
+
+  const iceServers = body.iceServers.filter(isIceServerPayload);
+  if (iceServers.length === 0) logTurnIssue("cloudflare_turn_ice_servers_empty");
+  return iceServers;
+}
+
+function readStaticTurnIceServers(env: Env): IceServerPayload[] {
+  const urls = parseCsv(env.TURN_URLS);
+  if (urls.length === 0) return [];
+  if (!env.TURN_USERNAME || !env.TURN_CREDENTIAL) {
+    console.warn(JSON.stringify({ event: "turn_static_credentials_missing" }));
+    return [];
+  }
+
+  return [{
+    urls,
+    username: env.TURN_USERNAME,
+    credential: env.TURN_CREDENTIAL
+  }];
+}
+
+function normalizeTurnTtl(value: string | undefined): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_TURN_TTL_SECONDS;
+  return Math.min(MAX_TURN_TTL_SECONDS, Math.max(60, parsed));
+}
+
+function hasRelayIceServer(iceServers: IceServerPayload[]): boolean {
+  return iceServers.some((server) => toUrlList(server.urls).some((url) => /^turns?:/i.test(url)));
+}
+
+function isIceServerPayload(value: unknown): value is IceServerPayload {
+  if (!isRecord(value)) return false;
+  const urls = value.urls;
+  return (
+    (typeof urls === "string" || (Array.isArray(urls) && urls.every((url) => typeof url === "string" && url.length > 0))) &&
+    (value.username === undefined || typeof value.username === "string") &&
+    (value.credential === undefined || typeof value.credential === "string")
+  );
+}
+
+function parseCsv(value: string | undefined): string[] {
+  return (value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function toUrlList(value: string | string[]): string[] {
+  return Array.isArray(value) ? value : [value];
+}
+
+function logTurnIssue(event: string, detail?: unknown): void {
+  const payload: Record<string, unknown> = { event };
+  if (detail instanceof Error) payload.message = detail.message;
+  if (isRecord(detail) && typeof detail.status === "number") payload.status = detail.status;
+  console.warn(JSON.stringify(payload));
 }
 
 async function readDeviceRegistration(request: Request): Promise<DeviceRegistrationPayload> {
