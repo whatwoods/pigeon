@@ -8,6 +8,7 @@ export interface Env {
   TURN_KEY_API_TOKEN?: string;
   TURN_TTL_SECONDS?: string;
   TURN_URLS?: string;
+  TURN_SHARED_SECRET?: string;
   TURN_USERNAME?: string;
   TURN_CREDENTIAL?: string;
 }

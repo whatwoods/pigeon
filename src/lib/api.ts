@@ -54,10 +54,15 @@ export const api = {
       body: "{}"
     });
   },
-  turn() {
+  turn(session: RoomSessionResponse) {
     return request<TurnResponse>("/api/turn", {
       method: "GET",
-      headers: {}
+      cache: "no-store",
+      headers: {
+        Authorization: `Bearer ${session.roomToken}`,
+        "X-Room-Id": session.roomId,
+        "X-Device-Id": session.deviceId
+      }
     });
   }
 };

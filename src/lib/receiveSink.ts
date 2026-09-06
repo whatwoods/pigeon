@@ -5,6 +5,7 @@ export interface ReceiveSink {
   writeChunk(entry: PackageEntry, bytes: Uint8Array): Promise<void>;
   finishFile(entry: PackageEntry): Promise<void>;
   finishPackage(): Promise<void>;
+  abort(): Promise<void>;
 }
 
 export async function createReceiveSink(manifest: PackageManifest): Promise<{ sink: ReceiveSink; mode: "directory" | "download" }> {
@@ -63,6 +64,13 @@ class DirectoryReceiveSink implements ReceiveSink {
     this.currentPath = undefined;
   }
 
+  async abort(): Promise<void> {
+    const writable = this.writable;
+    this.writable = undefined;
+    this.currentPath = undefined;
+    await writable?.abort();
+  }
+
   private async resolveFile(path: string): Promise<FileSystemFileHandle> {
     const parts = path.split("/").filter(Boolean);
     const fileName = parts.pop() || "download";
@@ -85,6 +93,12 @@ class DownloadReceiveSink implements ReceiveSink {
     if (this.current?.id === entry.id) return;
     this.current = entry;
     this.chunks = [];
+  }
+
+  async abort(): Promise<void> {
+    this.fileDataMap.clear();
+    this.chunks = [];
+    this.current = undefined;
   }
 
   async writeChunk(_entry: PackageEntry, bytes: Uint8Array): Promise<void> {

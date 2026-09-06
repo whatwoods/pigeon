@@ -57,6 +57,7 @@ export interface DeviceRegistrationPayload {
   deviceId: string;
   deviceName: string;
   publicKey: PublicJwk;
+  previousRoomToken?: string;
 }
 
 export interface RoomSessionResponse {

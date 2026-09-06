@@ -40,8 +40,7 @@ import type {
   RtcOfferMessage,
   SignalMessage,
   TextOfferMessage,
-  TextPayloadMessage,
-  TurnResponse
+  TextPayloadMessage
 } from "./shared/protocol";
 
 type ViewState = "idle" | "file_preview" | "sharing_link" | "enter_code" | "waiting" | "sending" | "success" | "error";
@@ -71,10 +70,6 @@ interface PendingTextSend {
   socket?: SignalSocket;
   expectedReceiverIds?: Set<string>;
 }
-
-const EMPTY_TURN: TurnResponse = {
-  iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-};
 
 const CONNECTION_ROUTE_LABELS: Record<ConnectionRoute, string> = {
   checking: "正在尝试直连",
@@ -121,7 +116,6 @@ export default function App() {
   const [copiedCode, setCopiedCode] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [shakeError, setShakeError] = useState(false);
-  const [turn, setTurn] = useState<TurnResponse>(EMPTY_TURN);
   const [toast, setToast] = useState<{ message: string; type: "success" | "warning" | "error" | "info" } | null>(null);
 
   const showToast = useCallback((message: string, type: "success" | "warning" | "error" | "info" = "info") => {
@@ -154,7 +148,6 @@ export default function App() {
         if (cancelled) return;
         identityRef.current = nextIdentity;
         setIdentity(nextIdentity);
-        refreshTurn();
 
         const session = await ensureRoom(nextIdentity);
         if (cancelled) return;
@@ -254,7 +247,8 @@ export default function App() {
     return {
       deviceId: nextIdentity.deviceId,
       deviceName: nextIdentity.deviceName,
-      publicKey: nextIdentity.publicKey
+      publicKey: nextIdentity.publicKey,
+      previousRoomToken: loadRoomSession(nextIdentity)?.roomToken
     };
   }
 
@@ -274,8 +268,12 @@ export default function App() {
     });
   }
 
-  function refreshTurn() {
-    api.turn().then(setTurn).catch(() => setTurn(EMPTY_TURN));
+  async function getTransferIceServers(): Promise<RTCIceServer[]> {
+    const currentIdentity = identityRef.current;
+    const session = currentIdentity && loadRoomSession(currentIdentity);
+    if (!session) throw new Error("房间尚未连接，请刷新页面重试");
+    const config = await api.turn(session);
+    return config.iceServers;
   }
 
   async function handleSignal(message: SignalMessage, source: SignalSource) {
@@ -499,6 +497,7 @@ export default function App() {
 
   useEffect(() => {
     const handleGlobalPaste = (event: ClipboardEvent) => {
+      if (event.defaultPrevented) return;
       if (view !== "idle" && view !== "enter_code") return;
       const files = event.clipboardData?.files;
       if (files && files.length > 0) {
@@ -693,13 +692,14 @@ export default function App() {
     setSendState("sending");
     setView("sending");
     const key = await deriveAesKey(currentIdentity.privateKey, message.receiverPublicKey);
+    const iceServers = await getTransferIceServers();
     const sender = new PackageSender({
       manifest: localPackage.manifest,
       files: localPackage.files,
       aesKey: key,
       targetDeviceId: message.receiverDeviceId,
       senderDeviceId: currentIdentity.deviceId,
-      iceServers: turn.iceServers as RTCIceServer[],
+      iceServers,
       signal: (signal) => sendPackageSignal(localPackage.manifest.packageId, signal),
       onProgress: (event) => {
         setProgress(event);
@@ -746,19 +746,22 @@ export default function App() {
     if (!currentIdentity || !incomingPackage) return;
     const { offer, source } = incomingPackage;
 
+    let receiveSink: Awaited<ReturnType<typeof createReceiveSink>>["sink"] | undefined;
     try {
       packageSources.current.set(offer.packageId, source);
       setConnectionRoute("checking");
       setView("sending");
       setStatus("正在尝试直连");
       const { sink, mode } = await createReceiveSink(offer.manifest);
+      receiveSink = sink;
       const key = await deriveAesKey(currentIdentity.privateKey, offer.senderPublicKey);
+      const iceServers = await getTransferIceServers();
       const receiver = new PackageReceiver({
         packageId: offer.packageId,
         receiverDeviceId: currentIdentity.deviceId,
         senderDeviceId: offer.senderDeviceId,
         aesKey: key,
-        iceServers: turn.iceServers as RTCIceServer[],
+        iceServers,
         sink,
         signal: (signal) => sendPackageSignal(offer.packageId, signal),
         onProgress: (event) => {
@@ -789,7 +792,11 @@ export default function App() {
         receiverPublicKey: currentIdentity.publicKey
       });
     } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") return;
+      await receiveSink?.abort().catch(() => {});
+      if (error instanceof DOMException && error.name === "AbortError") {
+        setView("idle");
+        return;
+      }
       setStatus(error instanceof Error ? error.message : "无法接收投递包");
       setView("error");
     }
@@ -859,7 +866,6 @@ export default function App() {
       activeReceiver.current?.close();
       activeReceiver.current = null;
       roomSocketRef.current?.close();
-      clearRoomSession();
       setOnlineDevices([]);
       setDeviceInviteUrl("");
       setStatus("正在创建新房间");
@@ -888,9 +894,9 @@ export default function App() {
     }
   }
 
-  async function submitReceiveCode() {
-    const code = receiveCode.trim().toUpperCase();
-    if (!code || !identity) return;
+  function submitReceiveCode(value: string) {
+    const code = value.trim().toUpperCase();
+    if (!/^[2-9A-Z]{6}$/.test(code) || !identity) return;
     connectPairReceiver(code, identity);
     setStatus("等待配对内容");
   }
@@ -1274,7 +1280,7 @@ function SharingCard({
   );
 }
 
-function ReceiveCodeCard({
+export function ReceiveCodeCard({
   value,
   onChange,
   onSubmit,
@@ -1283,7 +1289,7 @@ function ReceiveCodeCard({
 }: {
   value: string;
   onChange: (value: string) => void;
-  onSubmit: () => void;
+  onSubmit: (code: string) => void;
   onClose: () => void;
   hasError: boolean;
 }) {
@@ -1307,8 +1313,7 @@ function ReceiveCodeCard({
     }
     
     if (result.length === 6) {
-      // Allow state to update before submitting
-      setTimeout(onSubmit, 50);
+      onSubmit(result);
     }
   };
 
@@ -1323,13 +1328,14 @@ function ReceiveCodeCard({
 
   const handlePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
     e.preventDefault();
+    e.stopPropagation();
     const pastedData = e.clipboardData.getData("text").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
     if (pastedData) {
       onChange(pastedData.slice(0, 6));
       const nextFocusIndex = Math.min(pastedData.length, 5);
       inputsRef.current[nextFocusIndex]?.focus();
       if (pastedData.length >= 6) {
-        setTimeout(onSubmit, 50);
+        onSubmit(pastedData.slice(0, 6));
       }
     }
   };

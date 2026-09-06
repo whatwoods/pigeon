@@ -74,7 +74,7 @@ pigeon/
 
 ### 前置条件
 
-- [Node.js](https://nodejs.org/) (>= 18)
+- [Node.js](https://nodejs.org/) (>= 22.13，测试使用内置 SQLite)
 - npm
 
 ### 本地开发
@@ -97,6 +97,9 @@ npm run dev
 ```bash
 # 类型检查 + 生产构建
 npm run build
+
+# 部署前应用数据库迁移（包括 TURN 限流表）
+npm run db:migrate:remote
 
 # 部署到 Cloudflare Workers
 npm run deploy
@@ -121,15 +124,20 @@ npx wrangler secret put TURN_KEY_API_TOKEN
 npx wrangler secret put TURN_TTL_SECONDS
 ```
 
-`TURN_TTL_SECONDS` 默认 86400 秒，最大会被限制为 172800 秒。浏览器不会拿到长期 TURN key，`/api/turn` 会由 Worker 动态生成短期 `iceServers`。
+`TURN_TTL_SECONDS` 默认 600 秒，范围为 60–3600 秒。浏览器不会拿到长期 TURN key，`/api/turn` 会由 Worker 动态生成短期 `iceServers`。前端在开始发送或接收时获取凭证，避免页面停留后继续使用已过期的配置。
 
-也可以使用其他 TURN 服务作为静态兜底：
+也可以使用支持 TURN REST API 的服务（例如 coturn）作为兜底。在 TURN 服务端开启 `use-auth-secret`，将其 `static-auth-secret` 同步配置为 Worker secret：
 
 ```bash
 npx wrangler secret put TURN_URLS
-npx wrangler secret put TURN_USERNAME
-npx wrangler secret put TURN_CREDENTIAL
+npx wrangler secret put TURN_SHARED_SECRET
 ```
+
+Worker 使用共享密钥签发带到期时间的用户名与 HMAC 凭证，共享密钥不会返回浏览器。旧的 `TURN_USERNAME` / `TURN_CREDENTIAL` 永久凭证配置不再下发；升级时请改用 Cloudflare TURN 或上述共享密钥方式。
+
+`GET /api/turn` 要求 `Authorization: Bearer <roomToken>`、`X-Room-Id` 和 `X-Device-Id`，响应禁止缓存。每分钟最多允许每个设备 12 次、每个 IP 60 次请求，超限返回 429。部署前须应用 `0005_turn_rate_limits.sql`。
+
+设备加入其他房间或新建房间时，需要提交原来的 `previousRoomToken`；客户端会自动携带本机保存的凭证。匿名请求不能覆盖已经注册的设备 ID。
 
 ## 可用脚本
 
@@ -171,7 +179,8 @@ npx wrangler secret put TURN_CREDENTIAL
   │                                         │
   ├─ ECDH 派生 AES-256-GCM 密钥              ├─ ECDH 派生 AES-256-GCM 密钥
   │                                         │
-  ├─ 分片 → 每片独立 IV + AES-GCM 加密 ──────►│ 解密 → 校验 SHA-256 → 写入文件
+  ├─ 分片 → 每片独立 IV + AES-GCM 加密 ──────►│ 串行解密、写入 → 校验 SHA-256 → 提交文件
+  ├─ 等待接收确认 ◄─────────────────────────┤ 所有文件保存完成后确认
   │                                         │
   └─ 断线后从已接收分片处恢复 ◄────────────────┘ 上报已接收进度
 ```

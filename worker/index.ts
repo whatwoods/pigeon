@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { HTTPException } from "hono/http-exception";
 import type { DeviceRegistrationPayload, IceServerPayload, TurnResponse } from "../src/shared/protocol";
 import { randomId, randomToken, sha256Hex } from "./crypto";
 import { DeviceRoom, PairRoom } from "./durable";
@@ -9,7 +10,7 @@ export { DeviceRoom, PairRoom };
 const app = new Hono<{ Bindings: Env }>();
 
 app.onError((error, c) => {
-  return c.json({ error: error.message || "服务器错误" }, 500);
+  return c.json({ error: error.message || "服务器错误" }, error instanceof HTTPException ? error.status : 500);
 });
 
 app.all("/api/auth/*", (c) => c.json({ error: "账号功能已移除" }, 404));
@@ -25,7 +26,12 @@ app.post("/api/rooms", async (c) => {
   await c.env.DB.prepare("INSERT INTO rooms (id, created_at) VALUES (?, ?)")
     .bind(roomId, now)
     .run();
-  await upsertRoomDevice(c.env, roomId, roomToken, device, now);
+  try {
+    await upsertRoomDevice(c.env, roomId, roomToken, device, now);
+  } catch (error) {
+    await c.env.DB.prepare("DELETE FROM rooms WHERE id = ?").bind(roomId).run();
+    throw error;
+  }
 
   return c.json({ roomId, roomToken, deviceId: device.deviceId });
 });
@@ -120,6 +126,22 @@ app.get("/ws/room/:roomId", async (c) => {
 });
 
 app.get("/api/turn", async (c) => {
+  c.header("Cache-Control", "no-store");
+  const roomId = c.req.header("X-Room-Id");
+  const deviceId = c.req.header("X-Device-Id");
+  const token = c.req.header("Authorization")?.match(/^Bearer (\S+)$/i)?.[1];
+  if (!roomId || !deviceId || !token || !(await authenticateRoomDevice(c.env, roomId, token, deviceId))) {
+    return c.json({ error: "房间凭证无效" }, 401);
+  }
+  const now = Date.now();
+  const ip = c.req.header("CF-Connecting-IP") || "127.0.0.1";
+  if (!(await allowTurnRequest(c.env, deviceId, ip, now))) {
+    c.header("Retry-After", "60");
+    return c.json({ error: "中继凭证请求过于频繁，请稍后重试" }, 429);
+  }
+  c.executionCtx.waitUntil(
+    c.env.DB.prepare("DELETE FROM turn_rate_limits WHERE window_start < ?").bind(now - 120000).run()
+  );
   return c.json(await resolveIceServers(c.env));
 });
 
@@ -177,11 +199,28 @@ function createPairCode(): string {
 
 const DEFAULT_STUN_ICE_SERVERS: IceServerPayload[] = [{ urls: "stun:stun.l.google.com:19302" }];
 const CLOUDFLARE_TURN_CREDENTIAL_URL = "https://rtc.live.cloudflare.com/v1/turn/keys";
-const DEFAULT_TURN_TTL_SECONDS = 24 * 60 * 60;
-const MAX_TURN_TTL_SECONDS = 48 * 60 * 60;
+const DEFAULT_TURN_TTL_SECONDS = 10 * 60;
+const MAX_TURN_TTL_SECONDS = 60 * 60;
+
+async function allowTurnRequest(env: Env, deviceId: string, ip: string, now: number): Promise<boolean> {
+  const windowStart = Math.floor(now / 60000) * 60000;
+  const limits = [
+    { key: `device:${deviceId}`, limit: 12 },
+    { key: `ip:${await sha256Hex(ip)}`, limit: 60 }
+  ];
+  const results = await env.DB.batch(limits.map(({ key, limit }) => env.DB.prepare(
+    `INSERT INTO turn_rate_limits (key, window_start, count) VALUES (?, ?, 1)
+     ON CONFLICT(key) DO UPDATE SET
+       count = CASE WHEN window_start = excluded.window_start THEN count + 1 ELSE 1 END,
+       window_start = excluded.window_start
+     WHERE window_start != excluded.window_start OR count < ?
+     RETURNING count`
+  ).bind(key, windowStart, limit)));
+  return results.every((result) => result.results.length > 0);
+}
 
 async function resolveIceServers(env: Env): Promise<TurnResponse> {
-  const staticTurn = readStaticTurnIceServers(env);
+  const staticTurn = await createSharedSecretTurnIceServers(env);
 
   if (env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN) {
     const cloudflareIceServers = await fetchCloudflareTurnIceServers(env);
@@ -224,7 +263,7 @@ async function resolveIceServers(env: Env): Promise<TurnResponse> {
     };
   }
 
-  if (env.TURN_URLS || env.TURN_USERNAME || env.TURN_CREDENTIAL) {
+  if (env.TURN_URLS || env.TURN_SHARED_SECRET || env.TURN_USERNAME || env.TURN_CREDENTIAL) {
     console.warn(JSON.stringify({ event: "turn_static_config_incomplete" }));
   }
 
@@ -276,18 +315,24 @@ async function fetchCloudflareTurnIceServers(env: Env): Promise<IceServerPayload
   return iceServers;
 }
 
-function readStaticTurnIceServers(env: Env): IceServerPayload[] {
+async function createSharedSecretTurnIceServers(env: Env): Promise<IceServerPayload[]> {
   const urls = parseCsv(env.TURN_URLS);
   if (urls.length === 0) return [];
-  if (!env.TURN_USERNAME || !env.TURN_CREDENTIAL) {
+  if (!env.TURN_SHARED_SECRET) {
     console.warn(JSON.stringify({ event: "turn_static_credentials_missing" }));
     return [];
   }
 
+  const expiresAt = Math.floor(Date.now() / 1000) + normalizeTurnTtl(env.TURN_TTL_SECONDS);
+  const username = `${expiresAt}:${randomId()}`;
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(env.TURN_SHARED_SECRET), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(username));
   return [{
     urls,
-    username: env.TURN_USERNAME,
-    credential: env.TURN_CREDENTIAL
+    username,
+    credential: btoa(String.fromCharCode(...new Uint8Array(signature)))
   }];
 }
 
@@ -338,7 +383,8 @@ function readDeviceRegistrationValue(value: unknown): DeviceRegistrationPayload 
     !isRecord(value) ||
     typeof value.deviceId !== "string" ||
     typeof value.deviceName !== "string" ||
-    !isJsonWebKey(value.publicKey)
+    !isJsonWebKey(value.publicKey) ||
+    (value.previousRoomToken !== undefined && typeof value.previousRoomToken !== "string")
   ) {
     return null;
   }
@@ -346,7 +392,8 @@ function readDeviceRegistrationValue(value: unknown): DeviceRegistrationPayload 
   return {
     deviceId: value.deviceId,
     deviceName: value.deviceName.slice(0, 80),
-    publicKey: value.publicKey as JsonWebKey
+    publicKey: value.publicKey as JsonWebKey,
+    previousRoomToken: value.previousRoomToken as string | undefined
   };
 }
 
@@ -361,10 +408,16 @@ async function upsertRoomDevice(
   device: DeviceRegistrationPayload,
   now: number
 ): Promise<void> {
-  await env.DB.prepare(
-    `INSERT OR REPLACE INTO room_devices
+  const registered = await env.DB.prepare(
+    `INSERT INTO room_devices
       (id, room_id, token_hash, name, public_key, last_seen, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        room_id = excluded.room_id, token_hash = excluded.token_hash,
+        name = excluded.name, public_key = excluded.public_key,
+        last_seen = excluded.last_seen
+      WHERE room_devices.token_hash = ?
+      RETURNING id`
   )
     .bind(
       device.deviceId,
@@ -373,9 +426,11 @@ async function upsertRoomDevice(
       device.deviceName,
       JSON.stringify(device.publicKey),
       now,
-      now
+      now,
+      device.previousRoomToken ? await sha256Hex(device.previousRoomToken) : null
     )
-    .run();
+    .first<{ id: string }>();
+  if (!registered) throw new HTTPException(409, { message: "设备已注册，请使用原房间凭证迁移设备" });
 }
 
 async function authenticateRoomDevice(

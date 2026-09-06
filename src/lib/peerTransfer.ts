@@ -22,7 +22,9 @@ type ControlMessage =
   | { kind: "resume"; state: ResumeState }
   | { kind: "file:start"; entryId: string; startIndex: number }
   | { kind: "file:done"; entryId: string }
-  | { kind: "package:done" };
+  | { kind: "package:done" }
+  | { kind: "package:ack"; packageId: string }
+  | { kind: "package:error"; packageId: string; reason: string };
 
 export interface ProgressEvent {
   packageId: string;
@@ -35,7 +37,8 @@ export type ConnectionRoute = "checking" | "lan" | "direct" | "relay";
 
 const MAX_RETRY_ATTEMPTS = 5;
 const RETRY_DELAYS_MS = [900, 1600, 2800, 4600, 7000];
-const RESUME_TIMEOUT_MS = 2000;
+const RESUME_TIMEOUT_MS = 30000;
+const COMPLETION_TIMEOUT_MS = 120000;
 const CONNECTION_TIMEOUT_MS = 30000;
 
 export class PackageSender {
@@ -49,6 +52,9 @@ export class PackageSender {
   private connectionTimer?: number;
   private sendingRun = 0;
   private pendingResume?: (state: ResumeState) => void;
+  private rejectResume?: (error: Error) => void;
+  private pendingComplete?: () => void;
+  private rejectComplete?: (error: Error) => void;
   private pendingIce: RtcIceMessage[] = [];
   private closingPeer = false;
 
@@ -113,11 +119,20 @@ export class PackageSender {
 
     channel.binaryType = "arraybuffer";
     channel.bufferedAmountLowThreshold = DATA_CHANNEL_BUFFER_LIMIT / 2;
-    channel.onmessage = (event) => this.handleControlMessage(event.data);
+    channel.onmessage = (event) => {
+      if (this.channel !== channel) return;
+      try {
+        this.handleControlMessage(event.data);
+      } catch (error) {
+        this.fail(error instanceof Error ? error : new Error("无效的接收端响应"));
+      }
+    };
     channel.onopen = () => {
       this.clearConnectionTimer();
       this.updateConnectionRoute().catch(this.options.onError);
-      this.sendPackage(run).catch((error) => this.handleSendError(error));
+      this.sendPackage(run).catch((error) => {
+        if (run === this.sendingRun) this.handleSendError(error);
+      });
     };
     channel.onclose = () => this.scheduleRetry("传输通道已关闭");
     channel.onerror = () => this.scheduleRetry("传输通道出错");
@@ -170,12 +185,16 @@ export class PackageSender {
     const message = JSON.parse(data) as ControlMessage;
     if (message.kind === "resume") {
       this.pendingResume?.(message.state);
-      this.pendingResume = undefined;
+    }
+    if (message.kind === "package:ack" && message.packageId === this.options.manifest.packageId) {
+      this.pendingComplete?.();
+    }
+    if (message.kind === "package:error" && message.packageId === this.options.manifest.packageId) {
+      this.fail(new Error(message.reason));
     }
   }
 
   private async sendPackage(run: number): Promise<void> {
-    this.sendControl({ kind: "manifest", manifest: this.options.manifest, resumable: true });
     const resume = await this.waitForResumeState();
     if (this.cancelled || this.completed || run !== this.sendingRun) return;
 
@@ -192,16 +211,16 @@ export class PackageSender {
       if (!file) throw new Error(`缺少文件：${entry.relativePath}`);
 
       const startIndex = Math.min(resume.entries[entry.id] ?? 0, chunkCount(entry));
-      if (startIndex >= chunkCount(entry)) continue;
-
       this.sendControl({ kind: "file:start", entryId: entry.id, startIndex });
       let index = startIndex;
       for (let offset = startIndex * CHUNK_BYTES; offset < file.size; offset += CHUNK_BYTES) {
         if (this.cancelled || this.completed || run !== this.sendingRun) return;
         const bytes = new Uint8Array(await file.slice(offset, offset + CHUNK_BYTES).arrayBuffer());
         await this.waitForBuffer();
+        const frame = await packChunk(this.options.aesKey, entry.id, index, bytes);
+        if (this.cancelled || run !== this.sendingRun) return;
         this.assertChannelOpen();
-        this.channel?.send(await packChunk(this.options.aesKey, entry.id, index, bytes));
+        this.channel?.send(frame);
         sent += bytes.byteLength;
         index += 1;
         this.options.onProgress({
@@ -214,25 +233,57 @@ export class PackageSender {
       this.sendControl({ kind: "file:done", entryId: entry.id });
     }
 
+    await this.waitForCompletion();
+    if (this.cancelled || run !== this.sendingRun) return;
     this.completed = true;
-    this.sendControl({ kind: "package:done" });
+    if (this.retryTimer) window.clearTimeout(this.retryTimer);
     this.options.onComplete();
     this.closePeer();
   }
 
   private waitForResumeState(): Promise<ResumeState> {
-    return new Promise((resolve) => {
-      const fallback = window.setTimeout(() => {
-        if (this.pendingResume) {
-          this.pendingResume = undefined;
-          resolve({ entries: {} });
-        }
-      }, RESUME_TIMEOUT_MS);
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        this.pendingResume = undefined;
+        this.rejectResume = undefined;
+      };
+      this.rejectResume = (error) => { cleanup(); reject(error); };
+      const timeout = window.setTimeout(() => this.rejectResume?.(new Error("等待断点状态超时")), RESUME_TIMEOUT_MS);
       this.pendingResume = (state) => {
-        window.clearTimeout(fallback);
+        cleanup();
         resolve(normalizeResumeState(state));
       };
+      try {
+        this.sendControl({ kind: "manifest", manifest: this.options.manifest, resumable: true });
+      } catch (error) {
+        this.rejectResume?.(error instanceof Error ? error : new Error("无法发送清单"));
+      }
     });
+  }
+
+  private waitForCompletion(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        this.pendingComplete = undefined;
+        this.rejectComplete = undefined;
+      };
+      this.rejectComplete = (error) => { cleanup(); reject(error); };
+      const timeout = window.setTimeout(() => this.rejectComplete?.(new Error("等待接收确认超时")), COMPLETION_TIMEOUT_MS);
+      this.pendingComplete = () => { cleanup(); resolve(); };
+      try {
+        this.sendControl({ kind: "package:done" });
+      } catch (error) {
+        this.rejectComplete?.(error instanceof Error ? error : new Error("无法发送完成消息"));
+      }
+    });
+  }
+
+  private fail(error: Error): void {
+    if (this.cancelled || this.completed) return;
+    this.cancel();
+    this.options.onError(error);
   }
 
   private sendControl(value: ControlMessage): void {
@@ -297,7 +348,7 @@ export class PackageSender {
   private handleSendError(error: unknown): void {
     if (this.cancelled || this.completed) return;
     if (error instanceof Error && error.message.startsWith("缺少文件")) {
-      this.options.onError(error);
+      this.fail(error);
       return;
     }
     this.scheduleRetry(error instanceof Error ? error.message : "传输失败");
@@ -308,7 +359,7 @@ export class PackageSender {
     this.clearConnectionTimer();
     const retryAttempt = this.attempt;
     if (retryAttempt > MAX_RETRY_ATTEMPTS) {
-      this.options.onError(new Error(describeConnectionFailure(this.options.iceServers, reason)));
+      this.fail(new Error(describeConnectionFailure(this.options.iceServers, reason)));
       return;
     }
 
@@ -321,7 +372,8 @@ export class PackageSender {
   }
 
   private closePeer(): void {
-    this.pendingResume = undefined;
+    this.rejectResume?.(new Error("传输通道已断开"));
+    this.rejectComplete?.(new Error("传输通道已断开"));
     this.pendingIce = [];
     this.clearConnectionTimer();
     this.closingPeer = true;
@@ -378,6 +430,10 @@ export class PackageReceiver {
   private finishedEntries = new Set<string>();
   private fileHashes = new Map<string, Sha256Incremental>();
   private pendingIce: RtcIceMessage[] = [];
+  private dataQueue: Promise<void> = Promise.resolve();
+  private failed = false;
+  private closed = false;
+  private completed = false;
 
   constructor(
     private readonly options: {
@@ -398,6 +454,7 @@ export class PackageReceiver {
   }
 
   async handleOffer(message: RtcOfferMessage): Promise<void> {
+    if (this.failed || this.closed || message.packageId !== this.options.packageId || message.senderDeviceId !== this.options.senderDeviceId) return;
     if (!this.pc || this.pc.signalingState === "closed" || this.pc.remoteDescription) {
       this.createPeer();
     }
@@ -428,8 +485,10 @@ export class PackageReceiver {
   }
 
   close(): void {
+    this.closed = true;
     this.channel?.close();
     this.pc?.close();
+    void this.dataQueue.then(() => this.options.sink.abort()).catch(() => {});
   }
 
   private createPeer(): void {
@@ -444,7 +503,19 @@ export class PackageReceiver {
       this.channel = channel;
       channel.binaryType = "arraybuffer";
       channel.onmessage = (message) => {
-        this.handleData(message.data).catch(this.options.onError);
+        // DataChannel ordering does not wait for asynchronous decryption or disk writes.
+        this.dataQueue = this.dataQueue.then(async () => {
+          if (!this.failed && !this.closed) await this.handleData(message.data);
+        }).catch(async (error: unknown) => {
+          if (this.failed || this.closed) return;
+          this.failed = true;
+          const failure = error instanceof Error ? error : new Error("接收失败");
+          try {
+            this.sendControl({ kind: "package:error", packageId: this.options.packageId, reason: failure.message });
+          } catch {}
+          await this.options.sink.abort().catch(() => {});
+          this.options.onError(failure);
+        });
       };
       channel.onerror = () => this.options.onError(new Error("接收通道出错，请重试传输"));
     };
@@ -481,15 +552,19 @@ export class PackageReceiver {
     }
 
     const { header, bytes } = await unpackChunk(this.options.aesKey, data);
+    if (this.closed) return;
     const entry = this.entries.get(header.entryId);
     if (!entry) throw new Error("收到未知文件分片");
     if (this.finishedEntries.has(entry.id)) return;
+    if (this.currentEntry?.id !== entry.id) throw new Error("文件尚未准备好");
 
     const expectedIndex = this.receivedChunks.get(entry.id) ?? 0;
     if (header.index < expectedIndex) return;
     if (header.index > expectedIndex) {
       throw new Error("收到非连续文件分片，请重试传输");
     }
+    const expectedBytes = Math.min(CHUNK_BYTES, entry.size - expectedIndex * CHUNK_BYTES);
+    if (expectedBytes <= 0 || bytes.byteLength !== expectedBytes) throw new Error("文件分片大小无效");
 
     await this.options.sink.writeChunk(entry, bytes);
     this.ensureFileHash(entry.id).update(bytes);
@@ -505,6 +580,10 @@ export class PackageReceiver {
 
   private async handleControl(message: ControlMessage): Promise<void> {
     if (message.kind === "manifest") {
+      if (message.manifest.packageId !== this.options.packageId) throw new Error("投递包不匹配");
+      if (this.manifest && JSON.stringify(this.manifest) !== JSON.stringify(message.manifest)) {
+        throw new Error("断点续传清单已变更");
+      }
       this.manifest = message.manifest;
       this.entries = new Map(this.manifest.entries.map((entry) => [entry.id, entry]));
       this.received = bytesFromResume(this.manifest, this.currentResumeState());
@@ -516,6 +595,8 @@ export class PackageReceiver {
       const entry = this.entries.get(message.entryId);
       if (!entry) throw new Error("收到未知文件");
       if (this.finishedEntries.has(entry.id)) return;
+      if (this.currentEntry && this.currentEntry.id !== entry.id) throw new Error("上一个文件尚未完成");
+      if (message.startIndex !== (this.receivedChunks.get(entry.id) ?? 0)) throw new Error("断点位置不匹配");
       this.currentEntry = entry;
       this.ensureFileHash(entry.id);
       await this.options.sink.startFile(entry);
@@ -524,22 +605,35 @@ export class PackageReceiver {
 
     if (message.kind === "file:done") {
       const entry = this.entries.get(message.entryId);
-      if (entry && this.currentEntry?.id === entry.id) {
-        await this.options.sink.finishFile(entry);
-        const actualHash = this.ensureFileHash(entry.id).digestHex();
-        this.fileHashes.delete(entry.id);
-        if (actualHash !== entry.sha256.toLowerCase()) {
-          throw new Error(`文件校验失败：${entry.relativePath}`);
-        }
-        this.finishedEntries.add(entry.id);
-        this.currentEntry = undefined;
+      if (!entry) throw new Error("收到未知文件");
+      if (this.finishedEntries.has(entry.id)) return;
+      if (this.currentEntry?.id !== entry.id || (this.receivedChunks.get(entry.id) ?? 0) !== chunkCount(entry)) {
+        throw new Error("文件尚未接收完整");
       }
+      const actualHash = this.ensureFileHash(entry.id).digestHex();
+      if (actualHash !== entry.sha256.toLowerCase()) {
+        throw new Error(`文件校验失败：${entry.relativePath}`);
+      }
+      await this.options.sink.finishFile(entry);
+      this.fileHashes.delete(entry.id);
+      this.finishedEntries.add(entry.id);
+      this.currentEntry = undefined;
       return;
     }
 
     if (message.kind === "package:done") {
-      await this.options.sink.finishPackage();
-      this.options.onComplete();
+      if (!this.manifest || this.currentEntry || this.manifest.entries.some((entry) => !this.finishedEntries.has(entry.id))) {
+        throw new Error("投递包尚未接收完整");
+      }
+      if (!this.completed) {
+        await this.options.sink.finishPackage();
+        if (this.closed) return;
+        this.completed = true;
+        this.sendControl({ kind: "package:ack", packageId: this.options.packageId });
+        this.options.onComplete();
+      } else {
+        this.sendControl({ kind: "package:ack", packageId: this.options.packageId });
+      }
     }
   }
 
